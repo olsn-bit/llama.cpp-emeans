@@ -47,6 +47,7 @@ GGML_BACKEND_API bool ggml_cuda_emeans_init(const char * emns_path);
 GGML_BACKEND_API ggml_backend_buffer_t ggml_cuda_emeans_get_stub_buffer(ggml_backend_buffer_type_t buft);
 GGML_BACKEND_API void * ggml_cuda_emeans_bind_tensor(const char * gguf_name, int64_t ne0, int64_t ne1, int64_t ne2);
 GGML_BACKEND_API bool ggml_cuda_emeans_is_stub(const void * ptr);
+GGML_BACKEND_API size_t ggml_cuda_emeans_copy_raw_tensor(const char * gguf_name, float * dst_f32, size_t max_elems, int loop_start);
 
 #ifdef  __cplusplus
 }

@@ -572,6 +572,9 @@ llama_model_loader::llama_model_loader(
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
+    const char * emns_env = std::getenv("EMEANS_MODEL");
+    const bool allow_oob = (emns_env != nullptr && emns_env[0] != '\0');
+
     if (!fname.empty()) {
         // Load the main GGUF
         struct ggml_context * ctx = NULL;
@@ -603,7 +606,10 @@ llama_model_loader::llama_model_loader(
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            auto [it_w, _] = weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur, allow_oob));
+            if (it_w->second.is_oob) {
+                has_oob_weights = true;
+            }
         }
         auto paths = splits;
         uint16_t n_split = 0;
@@ -742,7 +748,10 @@ llama_model_loader::llama_model_loader(
                 }
                 n_elements += ggml_nelements(cur);
                 n_bytes    += ggml_nbytes(cur);
-                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), file_idx, ctx_gguf.get(), cur));
+                auto [it_w, _] = weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), file_idx, ctx_gguf.get(), cur, allow_oob));
+                if (it_w->second.is_oob) {
+                    has_oob_weights = true;
+                }
             }
         }
 
@@ -802,11 +811,20 @@ llama_model_loader::llama_model_loader(
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            auto [it_w, _] = weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur, allow_oob));
+            if (it_w->second.is_oob) {
+                has_oob_weights = true;
+            }
         }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name), nullptr, arch_name.c_str());
+    }
+
+    if (has_oob_weights) {
+        LLAMA_LOG_INFO("%s: [emeans] metadata-stub GGUF detected (weights outside file bounds); disabling mmap/direct_io\n", __func__);
+        use_mmap      = false;
+        use_direct_io = false;
     }
 
     n_kv      = gguf_get_n_kv(metadata);
@@ -1883,6 +1901,16 @@ bool llama_model_loader::load_all_data(
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     // allocated from the CPU buffer type, which uses vm_allocate on Apple platforms, so freeing it returns its pages to the OS right away
     ggml_backend_buffer_ptr read_buf;
+
+    int emns_loop_start = -1;
+    int n_emns_raw = 0;
+    if (has_oob_weights) {
+        uint32_t loop_start_u32 = 0;
+        if (get_key(LLM_KV_LOOP_START, loop_start_u32, false)) {
+            emns_loop_start = (int) loop_start_u32;
+        }
+    }
+
     for (struct ggml_tensor * cur : tensors) {
         if (cur->data != nullptr) {
             auto & em_api = llama_emeans_api::get();
@@ -1903,6 +1931,52 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (weight->is_oob) {
+            const char * tname = ggml_get_name(cur);
+            auto & em_api = llama_emeans_api::get();
+            const char * emns_env = std::getenv("EMEANS_MODEL");
+            if (em_api.ok() && em_api.copy_raw && emns_env && emns_env[0] && em_api.init(emns_env)) {
+                const size_t n_elems = (size_t) ggml_nelements(cur);
+                std::vector<float> tmp_f32(n_elems);
+                const size_t got = em_api.copy_raw(tname, tmp_f32.data(), n_elems, emns_loop_start);
+                if (got == n_elems) {
+                    if (cur->type == GGML_TYPE_F32) {
+                        if (check_tensors && !ggml_validate_row_data(cur->type, tmp_f32.data(), n_size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", tname));
+                        }
+                        ggml_backend_tensor_set(cur, tmp_f32.data(), 0, n_size);
+                    } else if (cur->type == GGML_TYPE_BF16) {
+                        std::vector<ggml_bf16_t> tmp_bf16(n_elems);
+                        ggml_fp32_to_bf16_row(tmp_f32.data(), tmp_bf16.data(), (int64_t) n_elems);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, tmp_bf16.data(), n_size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", tname));
+                        }
+                        ggml_backend_tensor_set(cur, tmp_bf16.data(), 0, n_size);
+                    } else if (cur->type == GGML_TYPE_F16) {
+                        std::vector<ggml_fp16_t> tmp_f16(n_elems);
+                        ggml_fp32_to_fp16_row(tmp_f32.data(), tmp_f16.data(), (int64_t) n_elems);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, tmp_f16.data(), n_size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", tname));
+                        }
+                        ggml_backend_tensor_set(cur, tmp_f16.data(), 0, n_size);
+                    } else {
+                        throw std::runtime_error(format("unsupported ggml type %s for .emns raw tensor '%s'", ggml_type_name(cur->type), tname));
+                    }
+                    n_emns_raw++;
+                    size_done += n_size;
+                    continue;
+                }
+            }
+            const size_t name_len = std::strlen(tname);
+            if (name_len > 6 && std::strcmp(tname + name_len - 6, ".scale") == 0) {
+                std::vector<uint8_t> zeros(n_size, 0);
+                ggml_backend_tensor_set(cur, zeros.data(), 0, n_size);
+                size_done += n_size;
+                continue;
+            }
+            throw std::runtime_error(format("tensor '%s' is outside metadata-stub GGUF file bounds and was not found in EMEANS_MODEL", tname));
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -2039,6 +2113,10 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    if (n_emns_raw > 0) {
+        LLAMA_LOG_INFO("%s: [emeans] loaded %d raw FP32/BF16 tensors from .emns VRAM\n", __func__, n_emns_raw);
     }
 
     // free temporary resources used for async uploads

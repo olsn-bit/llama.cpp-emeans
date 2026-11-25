@@ -18,11 +18,13 @@ struct llama_emeans_api {
     using get_buf_fn   = ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t);
     using bind_fn      = void * (*)(const char *, int64_t, int64_t, int64_t);
     using is_stub_fn   = bool (*)(const void *);
+    using copy_raw_fn  = size_t (*)(const char *, float *, size_t, int);
 
-    init_fn    init    = nullptr;
-    get_buf_fn get_buf = nullptr;
-    bind_fn    bind    = nullptr;
-    is_stub_fn is_stub = nullptr;
+    init_fn     init     = nullptr;
+    get_buf_fn  get_buf  = nullptr;
+    bind_fn     bind     = nullptr;
+    is_stub_fn  is_stub  = nullptr;
+    copy_raw_fn copy_raw = nullptr;
     bool resolved = false;
 
     static llama_emeans_api & get() {
@@ -32,10 +34,11 @@ struct llama_emeans_api {
             HMODULE mod = GetModuleHandleA("ggml-hip.dll");
             if (!mod) mod = GetModuleHandleA("ggml-cuda.dll");
             if (mod) {
-                api.init    = reinterpret_cast<init_fn>(GetProcAddress(mod, "ggml_cuda_emeans_init"));
-                api.get_buf = reinterpret_cast<get_buf_fn>(GetProcAddress(mod, "ggml_cuda_emeans_get_stub_buffer"));
-                api.bind    = reinterpret_cast<bind_fn>(GetProcAddress(mod, "ggml_cuda_emeans_bind_tensor"));
-                api.is_stub = reinterpret_cast<is_stub_fn>(GetProcAddress(mod, "ggml_cuda_emeans_is_stub"));
+                api.init     = reinterpret_cast<init_fn>(GetProcAddress(mod, "ggml_cuda_emeans_init"));
+                api.get_buf  = reinterpret_cast<get_buf_fn>(GetProcAddress(mod, "ggml_cuda_emeans_get_stub_buffer"));
+                api.bind     = reinterpret_cast<bind_fn>(GetProcAddress(mod, "ggml_cuda_emeans_bind_tensor"));
+                api.is_stub  = reinterpret_cast<is_stub_fn>(GetProcAddress(mod, "ggml_cuda_emeans_is_stub"));
+                api.copy_raw = reinterpret_cast<copy_raw_fn>(GetProcAddress(mod, "ggml_cuda_emeans_copy_raw_tensor"));
             }
         }
         return api;
@@ -51,11 +54,13 @@ struct llama_emeans_api {
     using get_buf_fn   = ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t);
     using bind_fn      = void * (*)(const char *, int64_t, int64_t, int64_t);
     using is_stub_fn   = bool (*)(const void *);
+    using copy_raw_fn  = size_t (*)(const char *, float *, size_t, int);
 
-    init_fn    init    = nullptr;
-    get_buf_fn get_buf = nullptr;
-    bind_fn    bind    = nullptr;
-    is_stub_fn is_stub = nullptr;
+    init_fn     init     = nullptr;
+    get_buf_fn  get_buf  = nullptr;
+    bind_fn     bind     = nullptr;
+    is_stub_fn  is_stub  = nullptr;
+    copy_raw_fn copy_raw = nullptr;
     bool resolved = false;
 
     static llama_emeans_api & get() {
@@ -65,10 +70,11 @@ struct llama_emeans_api {
             void * mod = dlopen("libggml-cuda.so", RTLD_LAZY | RTLD_NOLOAD);
             if (!mod) mod = dlopen("libggml-hip.so", RTLD_LAZY | RTLD_NOLOAD);
             void * handle = mod ? mod : RTLD_DEFAULT;
-            api.init    = reinterpret_cast<init_fn>(dlsym(handle, "ggml_cuda_emeans_init"));
-            api.get_buf = reinterpret_cast<get_buf_fn>(dlsym(handle, "ggml_cuda_emeans_get_stub_buffer"));
-            api.bind    = reinterpret_cast<bind_fn>(dlsym(handle, "ggml_cuda_emeans_bind_tensor"));
-            api.is_stub = reinterpret_cast<is_stub_fn>(dlsym(handle, "ggml_cuda_emeans_is_stub"));
+            api.init     = reinterpret_cast<init_fn>(dlsym(handle, "ggml_cuda_emeans_init"));
+            api.get_buf  = reinterpret_cast<get_buf_fn>(dlsym(handle, "ggml_cuda_emeans_get_stub_buffer"));
+            api.bind     = reinterpret_cast<bind_fn>(dlsym(handle, "ggml_cuda_emeans_bind_tensor"));
+            api.is_stub  = reinterpret_cast<is_stub_fn>(dlsym(handle, "ggml_cuda_emeans_is_stub"));
+            api.copy_raw = reinterpret_cast<copy_raw_fn>(dlsym(handle, "ggml_cuda_emeans_copy_raw_tensor"));
         }
         return api;
     }

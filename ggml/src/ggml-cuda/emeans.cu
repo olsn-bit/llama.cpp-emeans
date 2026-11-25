@@ -21,6 +21,7 @@
 #define hipFree                cudaFree
 #define hipMemcpy              cudaMemcpy
 #define hipMemcpyHostToDevice  cudaMemcpyHostToDevice
+#define hipMemcpyDeviceToHost  cudaMemcpyDeviceToHost
 #define hipGetErrorString      cudaGetErrorString
 #define EM_LAUNCH_BOUNDS       __launch_bounds__(256)
 #define EM_LAUNCH_BOUNDS_GEMV  __launch_bounds__(256)
@@ -620,6 +621,150 @@ bool ggml_cuda_emeans_is_stub(const void * ptr) {
     if (!st.loaded || !ptr || !st.stub_base) return false;
     const uint8_t * p = (const uint8_t *)ptr;
     return p >= st.stub_base && p < st.stub_base + EmnsState::MAX_STUBS * EmnsState::STUB_STRIDE;
+}
+
+size_t ggml_cuda_emeans_copy_raw_tensor(const char * gguf_name, float * dst_f32, size_t max_elems, int loop_start) {
+    if (!gguf_name || !dst_f32 || max_elems == 0) return 0;
+    auto & st = emns_state();
+    std::lock_guard<std::mutex> lock(st.mtx);
+    if (!st.loaded) return 0;
+
+    auto get_raw_plane = [&](const std::string & ename, const EmTensor ** out_em, const EmPlane ** out_plane) -> bool {
+        auto it = st.tensors.find(ename);
+        if (it == st.tensors.end()) return false;
+        const EmTensor & em = it->second;
+        if (em.fmt != EM_FMT_FP32) return false;
+        auto pit = em.planes.find("data");
+        if (pit == em.planes.end() || !pit->second.d_ptr || pit->second.nbytes == 0 || (pit->second.nbytes % sizeof(float)) != 0) {
+            return false;
+        }
+        *out_em = &em;
+        *out_plane = &pit->second;
+        return true;
+    };
+
+    auto copy_direct = [&](const std::string & ename) -> size_t {
+        const EmTensor * em = nullptr;
+        const EmPlane * pl = nullptr;
+        if (!get_raw_plane(ename, &em, &pl)) return 0;
+        const size_t n_elems = (size_t)(pl->nbytes / sizeof(float));
+        if (n_elems > max_elems) return 0;
+        if (hipMemcpy(dst_f32, pl->d_ptr, pl->nbytes, hipMemcpyDeviceToHost) != hipSuccess) return 0;
+        return n_elems;
+    };
+
+    std::string g(gguf_name);
+    if (g == "output_norm.weight")      return copy_direct("model.llm.norm.weight");
+    if (g == "output_res_query.weight") return copy_direct("model.llm.attn_res.output_query");
+    if (g == "token_embd_norm.weight")  return copy_direct("model.llm.embed_norm.weight");
+
+    if (g.rfind("blk.", 0) == 0) {
+        size_t dot2 = g.find('.', 4);
+        if (dot2 != std::string::npos) {
+            std::string idx_str = g.substr(4, dot2 - 4);
+            std::string suf = g.substr(dot2 + 1);
+            int bid = -1;
+            try { bid = std::stoi(idx_str); } catch (...) { bid = -1; }
+            std::string pfx = "model.llm.layers." + idx_str + ".";
+
+            if (suf == "loop_msg_query.weight") {
+                if (bid < 0 || loop_start < 0 || bid < loop_start) return 0;
+                const EmTensor * em_q = nullptr, * em_kv = nullptr;
+                const EmPlane * pl_q = nullptr, * pl_kv = nullptr;
+                if (!get_raw_plane("model.llm.middle_cycle_cross_pass_queries", &em_q, &pl_q) ||
+                    !get_raw_plane("model.llm.middle_cycle_cross_pass_kv_queries", &em_kv, &pl_kv)) {
+                    return 0;
+                }
+                if (em_q->shape.size() != 2 || em_kv->shape.size() != 2 ||
+                    em_q->shape[0] != em_kv->shape[0] || em_q->shape[1] != em_kv->shape[1]) {
+                    return 0;
+                }
+                const int64_t i = (int64_t)(bid - loop_start);
+                if (2 * i + 1 >= em_q->shape[0]) return 0;
+                const size_t D = (size_t)em_q->shape[1];
+                if (4 * D > max_elems || (size_t)(2 * i + 2) * D * sizeof(float) > pl_q->nbytes ||
+                    (size_t)(2 * i + 2) * D * sizeof(float) > pl_kv->nbytes) {
+                    return 0;
+                }
+                const size_t row_bytes = D * sizeof(float);
+                const uint8_t * q_base  = (const uint8_t *)pl_q->d_ptr;
+                const uint8_t * kv_base = (const uint8_t *)pl_kv->d_ptr;
+                if (hipMemcpy(dst_f32 + 0 * D, q_base  + (2 * i)     * row_bytes, row_bytes, hipMemcpyDeviceToHost) != hipSuccess ||
+                    hipMemcpy(dst_f32 + 1 * D, kv_base + (2 * i)     * row_bytes, row_bytes, hipMemcpyDeviceToHost) != hipSuccess ||
+                    hipMemcpy(dst_f32 + 2 * D, kv_base + (2 * i + 1) * row_bytes, row_bytes, hipMemcpyDeviceToHost) != hipSuccess ||
+                    hipMemcpy(dst_f32 + 3 * D, q_base  + (2 * i + 1) * row_bytes, row_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
+                    return 0;
+                }
+                return 4 * D;
+            }
+
+            if (suf == "attn_k_conv.weight" || suf == "attn_v_conv.weight") {
+                const char * kv_c = (suf == "attn_k_conv.weight") ? "k" : "v";
+                size_t got = copy_direct(pfx + "attn." + kv_c + "_sconv.weight");
+                if (got > 0) return got;
+                const EmTensor * em = nullptr;
+                const EmPlane * pl = nullptr;
+                if (!get_raw_plane(pfx + "attn." + kv_c + "_sconv.static_w", &em, &pl)) return 0;
+                if (em->shape.size() != 2) return 0;
+                const size_t K = (size_t)em->shape[0];
+                const size_t C = (size_t)em->shape[1];
+                const size_t n_elems = K * C;
+                if (n_elems == 0 || n_elems > max_elems || n_elems * sizeof(float) != pl->nbytes) return 0;
+                std::vector<float> tmp(n_elems);
+                if (hipMemcpy(tmp.data(), pl->d_ptr, pl->nbytes, hipMemcpyDeviceToHost) != hipSuccess) return 0;
+                // flip(0).T.contiguous(): dst[c, k] = tmp[K - 1 - k, c]
+                for (size_t c = 0; c < C; ++c) {
+                    for (size_t k = 0; k < K; ++k) {
+                        dst_f32[c * K + k] = tmp[(K - 1 - k) * C + c];
+                    }
+                }
+                return n_elems;
+            }
+
+            if (suf == "attn_rel_bias.weight") {
+                const EmTensor * em = nullptr;
+                const EmPlane * pl = nullptr;
+                if (!get_raw_plane(pfx + "attn.rel_logits_proj.proj", &em, &pl)) return 0;
+                if (em->shape.size() != 2) return 0;
+                const size_t R = (size_t)em->shape[0];
+                const size_t C = (size_t)em->shape[1];
+                const size_t n_elems = R * C;
+                if (n_elems == 0 || n_elems > max_elems || n_elems * sizeof(float) != pl->nbytes) return 0;
+                std::vector<float> tmp(n_elems);
+                if (hipMemcpy(tmp.data(), pl->d_ptr, pl->nbytes, hipMemcpyDeviceToHost) != hipSuccess) return 0;
+                // .T.contiguous(): dst[c, r] = tmp[r, c]
+                for (size_t c = 0; c < C; ++c) {
+                    for (size_t r = 0; r < R; ++r) {
+                        dst_f32[c * R + r] = tmp[r * C + c];
+                    }
+                }
+                return n_elems;
+            }
+
+            if (suf == "attn_res_query.weight") {
+                if (bid < 1) return 0;
+                return copy_direct("model.llm.attn_res.attn_queries." + std::to_string(bid - 1));
+            }
+            if (suf == "ffn_res_query.weight")    return copy_direct("model.llm.attn_res.mlp_queries." + idx_str);
+            if (suf == "attn_norm.weight")        return copy_direct(pfx + "attn_norm.weight");
+            if (suf == "attn_q_inp_norm.weight")  return copy_direct(pfx + "q_input_norm.weight");
+            if (suf == "attn_k_inp_norm.weight")  return copy_direct(pfx + "k_input_norm.weight");
+            if (suf == "attn_v_inp_norm.weight")  return copy_direct(pfx + "v_input_norm.weight");
+            if (suf == "ffn_norm.weight")         return copy_direct(pfx + "mlp_norm.weight");
+            if (suf == "exp_probs_b.bias")        return copy_direct(pfx + "mlp.gate.bias");
+            if (suf == "ffn_gate_inp.weight")     return copy_direct(pfx + "mlp.gate.weight");
+            if (suf == "attn_post_conv.weight")   return copy_direct(pfx + "attn_sconv.weight");
+            if (suf == "ffn_post_conv.weight")    return copy_direct(pfx + "mlp_sconv.weight");
+            if (suf == "attn_q_clip.weight")      return copy_direct(pfx + "attn.q_l2_clip.scale");
+            if (suf == "attn_rel_clip.weight")    return copy_direct(pfx + "attn.rel_l2_clip.scale");
+            if (suf == "attn_sink_proj.weight")   return copy_direct(pfx + "attn.attn_sink_proj.weight");
+            if (suf == "attn_k_conv_proj.weight") return copy_direct(pfx + "attn.k_sconv.weight_proj");
+            if (suf == "attn_v_conv_proj.weight") return copy_direct(pfx + "attn.v_sconv.weight_proj");
+        }
+    }
+
+    // Fallback: direct GGUF tensor name lookup in .emns
+    return copy_direct(g);
 }
 
 } // extern "C"
@@ -2356,6 +2501,7 @@ bool ggml_cuda_emeans_init_extra(const char *) { return false; }
 ggml_backend_buffer_t ggml_cuda_emeans_get_stub_buffer(ggml_backend_buffer_type_t) { return nullptr; }
 void * ggml_cuda_emeans_bind_tensor(const char *, int64_t, int64_t, int64_t) { return nullptr; }
 bool ggml_cuda_emeans_is_stub(const void *) { return false; }
+size_t ggml_cuda_emeans_copy_raw_tensor(const char *, float *, size_t, int) { return 0; }
 }
 bool ggml_cuda_emeans_has(const ggml_tensor *) { return false; }
 bool ggml_cuda_emeans_try_mul_mat(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }

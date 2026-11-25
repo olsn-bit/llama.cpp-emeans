@@ -2266,10 +2266,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             } else {
                 const char * emns_env = std::getenv("EMEANS_MODEL");
                 bool emns_bound_any = false;
-                if (emns_env && emns_env[0] && arch != LLM_ARCH_DFLASH && !ggml_backend_buft_is_host(buft)) {
+                ggml_backend_buffer_type_t emns_gpu_buft = !ggml_backend_buft_is_host(buft) ? buft : nullptr;
+                if (emns_gpu_buft == nullptr && ml.has_oob_weights && n_gpu_layers > 0) {
+                    ggml_backend_dev_t gpu_dev = (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) ? dev : nullptr;
+                    if (!gpu_dev) {
+                        for (const auto & d : devices) {
+                            if (d.dev && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                                gpu_dev = d.dev;
+                                break;
+                            }
+                        }
+                    }
+                    if (!gpu_dev) {
+                        gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+                    }
+                    if (gpu_dev) {
+                        emns_gpu_buft = ggml_backend_dev_buffer_type(gpu_dev);
+                    }
+                }
+                if (emns_env && emns_env[0] && arch != LLM_ARCH_DFLASH && emns_gpu_buft != nullptr) {
                     auto & em_api = llama_emeans_api::get();
                     if (em_api.ok() && em_api.init(emns_env)) {
-                        ggml_backend_buffer_t stub_buf = em_api.get_buf(buft);
+                        ggml_backend_buffer_t stub_buf = em_api.get_buf(emns_gpu_buft);
                         if (stub_buf) {
                             int n_bound = 0;
                             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -2300,7 +2318,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf)) {
                 std::vector<ggml_backend_buffer_t> lock_bufs;
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                    if (t->buffer != nullptr && std::find(lock_bufs.begin(), lock_bufs.end(), t->buffer) == lock_bufs.end()) {
+                    if (t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer) && std::find(lock_bufs.begin(), lock_bufs.end(), t->buffer) == lock_bufs.end()) {
                         lock_bufs.push_back(t->buffer);
                     }
                 }

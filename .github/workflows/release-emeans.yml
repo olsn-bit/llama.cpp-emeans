@@ -117,7 +117,7 @@ jobs:
     runs-on: windows-2022
     env:
       ROCM_VERSION: '10.0.0'
-      GPU_TARGETS: 'gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201'
+      GPU_TARGETS: 'gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -170,16 +170,74 @@ jobs:
           $ErrorActionPreference = "Stop"
           $hipDll = Get-ChildItem -Path build\bin\Release -Filter "ggml-hip*.dll" -ErrorAction SilentlyContinue
           if (-not $hipDll) { throw "ggml-hip.dll was not produced" }
+
+          $stageRoot = ".\rocm-stage"
+          $stageBin  = "$stageRoot\bin"
+          $stageKpack = "$stageRoot\.kpack"
+          $stageRbLib = "$stageBin\rocblas\library"
+          New-Item -ItemType Directory -Path $stageBin,$stageKpack,$stageRbLib -Force | Out-Null
+          Copy-Item -Path ".\build\bin\Release\ggml-hip.dll" -Destination $stageBin -Force
+
           $binPath = (rocm-sdk path --bin).Trim()
-          foreach ($pattern in @("amdhip64_7.dll", "rocm_kpack.dll", "amd_comgr.dll")) {
-            Get-ChildItem -Path $binPath -Filter $pattern -ErrorAction SilentlyContinue |
-              Copy-Item -Destination build\bin\Release -Force
+          $rocmSite = Split-Path (Split-Path $binPath -Parent) -Parent
+          $sdkDirs = @((Split-Path $binPath -Parent)) + (Get-ChildItem -Path $rocmSite -Directory -Filter "_rocm_sdk*" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) | Select-Object -Unique
+          $searchBinDirs = $sdkDirs | ForEach-Object { Join-Path $_ "bin" } | Where-Object { Test-Path $_ } | Select-Object -Unique
+
+          $requiredDlls = @(
+            "amdhip64_7.dll",
+            "rocm_kpack.dll",
+            "amd_comgr.dll",
+            "hipblas.dll",
+            "rocblas.dll",
+            "rocsolver.dll",
+            "libhipblaslt.dll",
+            "libtensilelite-host.dll",
+            "origami.dll"
+          )
+          foreach ($dll in $requiredDlls) {
+            $found = $null
+            foreach ($dir in $searchBinDirs) {
+              $cand = Join-Path $dir $dll
+              if (Test-Path $cand) { $found = $cand; break }
+            }
+            if (-not $found) {
+              throw "Required ROCm runtime DLL not found: $dll (searched: $($searchBinDirs -join ', '))"
+            }
+            Copy-Item -Path $found -Destination $stageBin -Force
           }
-          7z a -snl llama-bin-win-rocm-x64.zip `
-            .\build\bin\Release\ggml-hip.dll `
-            .\build\bin\Release\amdhip64_7.dll `
-            .\build\bin\Release\rocm_kpack.dll `
-            .\build\bin\Release\amd_comgr.dll
+
+          # Copy rocblas/library and .kpack/blas_lib_*.kpack for targeted RDNA archs (required by rocblas.dll without ROCm in PATH)
+          $targetRegex = ($env:GPU_TARGETS -split ';') -join '|'
+          foreach ($dir in $searchBinDirs) {
+            $rbSrc = Join-Path $dir "rocblas\library"
+            if (Test-Path $rbSrc) {
+              Get-ChildItem -Path $rbSrc -File | Where-Object {
+                ($_.Name -match $targetRegex) -or ($_.Name -match 'generic') -or ($_.Name -notmatch 'gfx\d+')
+              } | ForEach-Object {
+                Copy-Item -Path $_.FullName -Destination $stageRbLib -Force
+              }
+            }
+          }
+          $rbStaged = (Get-ChildItem -Path $stageRbLib -File -ErrorAction SilentlyContinue).Count
+          if ($rbStaged -eq 0) { throw "No rocblas/library files found for targets $($env:GPU_TARGETS)" }
+
+          foreach ($dir in $sdkDirs) {
+            $kpSrc = Join-Path $dir ".kpack"
+            if (Test-Path $kpSrc) {
+              Get-ChildItem -Path $kpSrc -Filter "blas_lib_*.kpack" -File | Where-Object {
+                $_.Name -match $targetRegex
+              } | ForEach-Object {
+                Copy-Item -Path $_.FullName -Destination $stageKpack -Force
+              }
+            }
+          }
+          $kpStaged = (Get-ChildItem -Path $stageKpack -File -ErrorAction SilentlyContinue).Count
+          Write-Host "Bundled $rbStaged rocblas/library files and $kpStaged blas_lib .kpack files"
+
+          Push-Location $stageRoot
+          7z a -snl ..\llama-bin-win-rocm-x64.zip bin .kpack
+          if ($LASTEXITCODE -ne 0) { Pop-Location; throw "7z failed with exit code $LASTEXITCODE" }
+          Pop-Location
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -327,14 +385,19 @@ jobs:
           temp_dir=$(mktemp -d)
           unzip -q artifact/llama-bin-win-cpu-x64.zip -d "$temp_dir"
 
-          for backend in cuda-12.4 rocm; do
-            src_zip="artifact/llama-bin-win-${backend}-x64.zip"
-            out_zip="release/llama-emeans-${TAG}-win-${backend}-x64.zip"
-            cp "$src_zip" "$out_zip"
-            out_real=$(realpath "$out_zip")
-            (cd "$temp_dir" && zip -q -r "$out_real" .)
-          done
-          rm -rf "$temp_dir"
+          # Windows CUDA: flat root layout
+          cp artifact/llama-bin-win-cuda-12.4-x64.zip "release/llama-emeans-${TAG}-win-cuda-12.4-x64.zip"
+          out_cuda=$(realpath "release/llama-emeans-${TAG}-win-cuda-12.4-x64.zip")
+          (cd "$temp_dir" && zip -q -r "$out_cuda" .)
+
+          # Windows ROCm: bin/ + .kpack/ layout (rocblas.dll resolves ../.kpack/blas_lib_*.kpack)
+          temp_rocm=$(mktemp -d)
+          mkdir -p "$temp_rocm/bin"
+          cp -a "$temp_dir"/. "$temp_rocm/bin/"
+          cp artifact/llama-bin-win-rocm-x64.zip "release/llama-emeans-${TAG}-win-rocm-x64.zip"
+          out_rocm=$(realpath "release/llama-emeans-${TAG}-win-rocm-x64.zip")
+          (cd "$temp_rocm" && zip -q -r "$out_rocm" bin)
+          rm -rf "$temp_dir" "$temp_rocm"
 
           mv artifact/llama-bin-ubuntu-cuda-12.8-x64.tar.gz "release/llama-emeans-${TAG}-ubuntu-cuda-12.8-x64.tar.gz"
           mv artifact/llama-bin-ubuntu-rocm-x64.tar.gz "release/llama-emeans-${TAG}-ubuntu-rocm-x64.tar.gz"
@@ -354,13 +417,15 @@ jobs:
 
             ### Downloads
             - **Windows (NVIDIA CUDA 12.4):** `llama-emeans-${{ steps.tag.outputs.name }}-win-cuda-12.4-x64.zip` *(CUDA runtime DLLs included)*
-            - **Windows (AMD ROCm / HIP):** `llama-emeans-${{ steps.tag.outputs.name }}-win-rocm-x64.zip` *(RDNA 1–4 `gfx1010–gfx1201`, HIP runtime DLLs included)*
+            - **Windows (AMD ROCm / HIP):** `llama-emeans-${{ steps.tag.outputs.name }}-win-rocm-x64.zip` *(RDNA 2–4 `gfx1030–gfx1201` + Strix Halo `gfx1151`, HIP/hipBLAS/rocBLAS runtime DLLs included)*
             - **Linux (Ubuntu NVIDIA CUDA 12.8):** `llama-emeans-${{ steps.tag.outputs.name }}-ubuntu-cuda-12.8-x64.tar.gz` *(CUDA runtime `.so` included)*
             - **Linux (Ubuntu AMD ROCm / HIP):** `llama-emeans-${{ steps.tag.outputs.name }}-ubuntu-rocm-x64.tar.gz`
 
-            ### Quick Start
-            Unzip, set `EMEANS_MODEL` to your `.emns` file (`Inkling-2-Mini-3.04bpw.emns` for 12 GB+ VRAM, or `Inkling-2-Mini-2.27bpw.emns` for 8 GB VRAM), and launch `llama-server` with the metadata stub GGUF:
-            ```powershell
-            $env:EMEANS_MODEL = "Inkling-2-Mini-3.04bpw.emns"
-            .\llama-server.exe -m Inkling-2-Mini-metadata-stub.gguf -ngl 99 -c 53248 -fa on -ctk q4_0 -ctv q4_0 --fit off --port 8080
-            ```
+            ### Quick Start (3 Steps)
+            1. **Download & unzip** the archive for your OS/GPU, plus `Inkling-2-Mini-metadata-stub.gguf` and an `.emns` weight file (`Inkling-2-Mini-3.04bpw.emns` for 12 GB+ VRAM, or `Inkling-2-Mini-2.27bpw.emns` for 8 GB VRAM).
+            2. **Set `EMEANS_MODEL` and start `llama-server`** *(use `.\bin\llama-server.exe` on Windows ROCm)*:
+               ```powershell
+               $env:EMEANS_MODEL = "Inkling-2-Mini-3.04bpw.emns"
+               .\llama-server.exe -m Inkling-2-Mini-metadata-stub.gguf -ngl 99 -c 53248 -ub 128 -fa on -ctk q4_0 -ctv q4_0 --fit off --port 8080
+               ```
+            3. **Open `http://127.0.0.1:8080`** in your browser (or connect any OpenAI-compatible client to `http://127.0.0.1:8080/v1`).
