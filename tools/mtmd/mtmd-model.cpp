@@ -25,6 +25,151 @@
 #include <functional>
 #include <float.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+// --- Minimal E-Means Vision (.emns) Loader Helpers (GPU stub-bind + CPU 4-bit dequant) ---
+namespace {
+
+struct mtmd_emns_gpu_api {
+    using init_extra_fn = bool (*)(const char *);
+    using get_buf_fn    = ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t);
+    using bind_fn       = void * (*)(const char *, int64_t, int64_t, int64_t);
+
+    init_extra_fn init_extra = nullptr;
+    get_buf_fn    get_buf    = nullptr;
+    bind_fn       bind       = nullptr;
+
+    static mtmd_emns_gpu_api resolve() {
+        mtmd_emns_gpu_api api;
+#ifdef _WIN32
+        HMODULE mod = GetModuleHandleA("ggml-hip.dll");
+        if (!mod) mod = GetModuleHandleA("ggml-cuda.dll");
+        if (mod) {
+            api.init_extra = reinterpret_cast<init_extra_fn>(GetProcAddress(mod, "ggml_cuda_emeans_init_extra"));
+            api.get_buf    = reinterpret_cast<get_buf_fn>(GetProcAddress(mod, "ggml_cuda_emeans_get_stub_buffer"));
+            api.bind       = reinterpret_cast<bind_fn>(GetProcAddress(mod, "ggml_cuda_emeans_bind_tensor"));
+        }
+#endif
+        return api;
+    }
+    bool ok() const { return init_extra && get_buf && bind; }
+};
+
+struct mtmd_emns_plane { uint64_t off = 0, nbytes = 0; };
+struct mtmd_emns_entry {
+    uint32_t fmt = 0;
+    std::vector<int64_t> shape;
+    std::map<std::string, mtmd_emns_plane> planes;
+};
+
+static void mtmd_em_ws(const char * s, size_t n, size_t & i) {
+    while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
+}
+static bool mtmd_em_str(const char * s, size_t n, size_t & i, std::string & out) {
+    mtmd_em_ws(s, n, i);
+    if (i >= n || s[i] != '"') return false;
+    ++i; out.clear();
+    while (i < n && s[i] != '"') {
+        if (s[i] == '\\' && i + 1 < n) { ++i; out.push_back(s[i++]); }
+        else { out.push_back(s[i++]); }
+    }
+    if (i >= n || s[i] != '"') return false;
+    ++i; return true;
+}
+static bool mtmd_em_u64(const char * s, size_t n, size_t & i, uint64_t & out) {
+    mtmd_em_ws(s, n, i);
+    if (i >= n || s[i] < '0' || s[i] > '9') return false;
+    uint64_t v = 0;
+    while (i < n && s[i] >= '0' && s[i] <= '9') v = v * 10 + (uint64_t)(s[i++] - '0');
+    out = v; return true;
+}
+static bool mtmd_em_skip(const char * s, size_t n, size_t & i) {
+    mtmd_em_ws(s, n, i);
+    if (i >= n) return false;
+    if (s[i] == '"') { std::string tmp; return mtmd_em_str(s, n, i, tmp); }
+    if (s[i] == '{' || s[i] == '[') {
+        char op = s[i], cl = (op == '{') ? '}' : ']'; int d = 0;
+        while (i < n) {
+            if (s[i] == '"') { std::string tmp; if (!mtmd_em_str(s, n, i, tmp)) return false; continue; }
+            if (s[i] == op) ++d;
+            else if (s[i] == cl && --d == 0) { ++i; return true; }
+            ++i;
+        }
+        return false;
+    }
+    while (i < n && s[i] != ',' && s[i] != '}' && s[i] != ']') ++i;
+    return true;
+}
+
+static bool mtmd_emns_load_cpu_index(const char * path, uint64_t & data_base, std::map<std::string, mtmd_emns_entry> & out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    char magic[8]; uint64_t mlen = 0;
+    if (!f.read(magic, 8) || std::memcmp(magic, "EMNS0001", 8) != 0 || !f.read(reinterpret_cast<char *>(&mlen), 8)) return false;
+    std::string mjson(mlen, '\0');
+    if (!f.read(&mjson[0], mlen)) return false;
+    data_base = (16ULL + mlen + 63ULL) & ~63ULL;
+
+    const char * s = mjson.c_str(); const size_t n = mjson.size();
+    size_t pos = mjson.find("\"tensors\"");
+    if (pos == std::string::npos) return false;
+    size_t i = pos + 9;
+    mtmd_em_ws(s, n, i); if (i >= n || s[i++] != ':') return false;
+    mtmd_em_ws(s, n, i); if (i >= n || s[i++] != '[') return false;
+    while (i < n) {
+        mtmd_em_ws(s, n, i);
+        if (i < n && s[i] == ']') return true;
+        if (i >= n || s[i++] != '{') return false;
+        std::string tname; mtmd_emns_entry e;
+        while (i < n) {
+            mtmd_em_ws(s, n, i);
+            if (i < n && s[i] == '}') { ++i; break; }
+            std::string k; if (!mtmd_em_str(s, n, i, k)) return false;
+            mtmd_em_ws(s, n, i); if (i >= n || s[i++] != ':') return false;
+            if (k == "name") { if (!mtmd_em_str(s, n, i, tname)) return false; }
+            else if (k == "fmt") { uint64_t v = 0; if (!mtmd_em_u64(s, n, i, v)) return false; e.fmt = (uint32_t)v; }
+            else if (k == "shape") {
+                mtmd_em_ws(s, n, i); if (i >= n || s[i++] != '[') return false;
+                while (i < n) {
+                    mtmd_em_ws(s, n, i); if (s[i] == ']') { ++i; break; }
+                    uint64_t d = 0; if (!mtmd_em_u64(s, n, i, d)) return false;
+                    e.shape.push_back((int64_t)d);
+                    mtmd_em_ws(s, n, i); if (i < n && s[i] == ',') ++i;
+                }
+            } else if (k == "planes") {
+                mtmd_em_ws(s, n, i); if (i >= n || s[i++] != '{') return false;
+                while (i < n) {
+                    mtmd_em_ws(s, n, i); if (s[i] == '}') { ++i; break; }
+                    std::string pk; if (!mtmd_em_str(s, n, i, pk)) return false;
+                    mtmd_em_ws(s, n, i); if (i >= n || s[i++] != ':') return false;
+                    mtmd_em_ws(s, n, i); if (i >= n || s[i++] != '[') return false;
+                    mtmd_emns_plane pl;
+                    if (!mtmd_em_u64(s, n, i, pl.off)) return false;
+                    mtmd_em_ws(s, n, i); if (i >= n || s[i++] != ',') return false;
+                    if (!mtmd_em_u64(s, n, i, pl.nbytes)) return false;
+                    mtmd_em_ws(s, n, i); if (i >= n || s[i++] != ']') return false;
+                    e.planes[pk] = pl;
+                    mtmd_em_ws(s, n, i); if (i < n && s[i] == ',') ++i;
+                }
+            } else { if (!mtmd_em_skip(s, n, i)) return false; }
+            mtmd_em_ws(s, n, i); if (i < n && s[i] == ',') ++i;
+        }
+        if (!tname.empty()) out[tname] = std::move(e);
+        mtmd_em_ws(s, n, i); if (i < n && s[i] == ',') ++i;
+    }
+    return false;
+}
+
+} // namespace
+
 //
 // mtmd_model_loader
 //
@@ -4472,15 +4617,114 @@ struct mtmd_model_loader {
                 total_data_size += ggml_nbytes(t);
             }
 
+            // Optional E-Means 4-bit vision tower (EMEANS_VISION_MODEL)
+            const char * emns_vis_path = std::getenv("EMEANS_VISION_MODEL");
+            std::unordered_set<std::string> emns_gpu_bound;
+            bool emns_cpu_active = false;
+            uint64_t emns_cpu_base = 0;
+            std::map<std::string, mtmd_emns_entry> emns_cpu_index;
+            std::ifstream emns_cpu_fin;
+
+            if (emns_vis_path && emns_vis_path[0]) {
+                if (!ggml_backend_buft_is_host(buft)) {
+                    auto api = mtmd_emns_gpu_api::resolve();
+                    if (api.ok() && api.init_extra(emns_vis_path)) {
+                        ggml_backend_buffer_t stub_buf = api.get_buf(buft);
+                        if (stub_buf) {
+                            for (auto & t : tensors_to_load) {
+                                ggml_tensor * cur = ggml_get_tensor(model.ctx_data.get(), t->name);
+                                if (!cur) continue;
+                                void * sp = api.bind(cur->name, cur->ne[0], cur->ne[1], cur->ne[2]);
+                                if (sp) {
+                                    cur->buffer = stub_buf;
+                                    cur->data   = sp;
+                                    emns_gpu_bound.insert(cur->name);
+                                }
+                            }
+                            fprintf(stderr, "[emeans-vision] GPU bound %zu 4-bit tensors from '%s'\n",
+                                    emns_gpu_bound.size(), emns_vis_path);
+                            LOG_INF("[emeans-vision] GPU bound %zu 4-bit tensors from '%s'\n",
+                                    emns_gpu_bound.size(), emns_vis_path);
+                        }
+                    } else {
+                        LOG_WRN("[emeans-vision] WARN: failed to init GPU vision .emns '%s', falling back to GGUF\n", emns_vis_path);
+                    }
+                } else {
+                    if (mtmd_emns_load_cpu_index(emns_vis_path, emns_cpu_base, emns_cpu_index)) {
+                        emns_cpu_fin.open(emns_vis_path, std::ios::binary);
+                        if (emns_cpu_fin) {
+                            emns_cpu_active = true;
+                        }
+                    } else {
+                        LOG_WRN("[emeans-vision] WARN: failed to parse CPU vision .emns '%s', falling back to GGUF\n", emns_vis_path);
+                    }
+                }
+            }
+
             // alloc memory and offload data
             model.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), buft));
-            ggml_backend_buffer_set_usage(model.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (model.buf) {
+                ggml_backend_buffer_set_usage(model.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
             // read the weight from file
             if (!no_alloc) {
                 size_t data_loaded = 0;
+                size_t emns_cpu_deq = 0;
                 for (auto & t : tensors_to_load) {
+                    if (emns_gpu_bound.count(t->name)) {
+                        data_loaded += ggml_nbytes(t);
+                        continue;
+                    }
                     ggml_tensor * cur = ggml_get_tensor(model.ctx_data.get(), t->name);
                     GGML_ASSERT(cur && "tensor not found in ctx_data");
+
+                    if (emns_cpu_active && cur->type == GGML_TYPE_F16 && ggml_backend_buft_is_host(buft)) {
+                        auto it_em = emns_cpu_index.find(t->name);
+                        if (it_em != emns_cpu_index.end() && it_em->second.fmt == 3 &&
+                            it_em->second.shape.size() == 2 &&
+                            it_em->second.shape[0] == cur->ne[1] && it_em->second.shape[1] == cur->ne[0]) {
+                            const auto & e = it_em->second;
+                            const auto & p_lo  = e.planes.at("lo4");
+                            const auto & p_sc  = e.planes.at("scales");
+                            const auto & p_lut = e.planes.at("lut");
+                            const int64_t N = cur->ne[1];
+                            const int64_t K = cur->ne[0];
+                            std::vector<uint32_t> lo4((size_t)(p_lo.nbytes / 4));
+                            std::vector<ggml_fp16_t> sc((size_t)(p_sc.nbytes / 2));
+                            ggml_fp16_t lut16[16];
+                            emns_cpu_fin.seekg((std::streamoff)(emns_cpu_base + p_lo.off), std::ios::beg);
+                            emns_cpu_fin.read(reinterpret_cast<char *>(lo4.data()), p_lo.nbytes);
+                            emns_cpu_fin.seekg((std::streamoff)(emns_cpu_base + p_sc.off), std::ios::beg);
+                            emns_cpu_fin.read(reinterpret_cast<char *>(sc.data()), p_sc.nbytes);
+                            emns_cpu_fin.seekg((std::streamoff)(emns_cpu_base + p_lut.off), std::ios::beg);
+                            emns_cpu_fin.read(reinterpret_cast<char *>(lut16), 32);
+                            float lut32[16];
+                            for (int li = 0; li < 16; ++li) lut32[li] = ggml_fp16_to_fp32(lut16[li]);
+                            ggml_fp16_t * dst = reinterpret_cast<ggml_fp16_t *>(cur->data);
+                            const int64_t k8 = K >> 3;
+                            const int64_t k64 = K >> 6;
+                            for (int64_t r = 0; r < N; ++r) {
+                                const uint32_t * row_lo = lo4.data() + r * k8;
+                                const ggml_fp16_t * row_sc = sc.data() + r * k64;
+                                ggml_fp16_t * row_dst = dst + r * K;
+                                for (int64_t g = 0; g < k64; ++g) {
+                                    const float s = ggml_fp16_to_fp32(row_sc[g]);
+                                    const uint32_t * glo = row_lo + g * 8;
+                                    ggml_fp16_t * gdst = row_dst + g * 64;
+                                    for (int w = 0; w < 8; ++w) {
+                                        uint32_t v = glo[w];
+                                        for (int b = 0; b < 8; ++b) {
+                                            gdst[w * 8 + b] = ggml_fp32_to_fp16(lut32[(v >> (b * 4)) & 0xFu] * s);
+                                        }
+                                    }
+                                }
+                            }
+                            ++emns_cpu_deq;
+                            data_loaded += ggml_nbytes(cur);
+                            continue;
+                        }
+                    }
+
                     auto it_off = tensor_offset.find(t->name);
                     GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
                     const size_t offset = it_off->second;
@@ -4505,6 +4749,12 @@ struct mtmd_model_loader {
                             throw std::runtime_error(mtmd_format("%s: model loading cancelled by progress_callback\n", __func__));
                         }
                     }
+                }
+                if (emns_cpu_active) {
+                    fprintf(stderr, "[emeans-vision] CPU dequantized %zu 4-bit tensors from '%s'\n",
+                            emns_cpu_deq, emns_vis_path);
+                    LOG_INF("[emeans-vision] CPU dequantized %zu 4-bit tensors from '%s'\n",
+                            emns_cpu_deq, emns_vis_path);
                 }
                 LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(), fname.c_str());
             } else {

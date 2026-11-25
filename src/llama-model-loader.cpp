@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "llama-emeans-hook.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1883,6 +1884,12 @@ bool llama_model_loader::load_all_data(
     // allocated from the CPU buffer type, which uses vm_allocate on Apple platforms, so freeing it returns its pages to the OS right away
     ggml_backend_buffer_ptr read_buf;
     for (struct ggml_tensor * cur : tensors) {
+        if (cur->data != nullptr) {
+            auto & em_api = llama_emeans_api::get();
+            if (em_api.ok() && em_api.is_stub(cur->data)) {
+                continue;
+            }
+        }
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models

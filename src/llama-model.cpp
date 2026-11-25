@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-emeans-hook.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -2263,7 +2264,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                const char * emns_env = std::getenv("EMEANS_MODEL");
+                bool emns_bound_any = false;
+                if (emns_env && emns_env[0] && arch != LLM_ARCH_DFLASH && !ggml_backend_buft_is_host(buft)) {
+                    auto & em_api = llama_emeans_api::get();
+                    if (em_api.ok() && em_api.init(emns_env)) {
+                        ggml_backend_buffer_t stub_buf = em_api.get_buf(buft);
+                        if (stub_buf) {
+                            int n_bound = 0;
+                            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                                if (t->data != nullptr) continue;
+                                void * stub_ptr = em_api.bind(t->name, t->ne[0], t->ne[1], t->ne[2]);
+                                if (stub_ptr) {
+                                    t->data   = stub_ptr;
+                                    t->buffer = stub_buf;
+                                    n_bound++;
+                                }
+                            }
+                            if (n_bound > 0) {
+                                emns_bound_any = true;
+                                LLAMA_LOG_INFO("%s: [emeans] bound %d tensors directly to .emns VRAM (0 MiB GGUF VRAM)\n", __func__, n_bound);
+                            }
+                        }
+                    }
+                }
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer for remaining tensors
+                if (buf == nullptr && emns_bound_any) {
+                    buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -2357,6 +2385,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    {
+        const char * emns_env_sc = std::getenv("EMEANS_MODEL");
+        if (emns_env_sc && emns_env_sc[0]) {
+            w_scales.clear();
+            for (auto & l : layers) {
+                l.ffn_gate_exps_s = nullptr;
+                l.ffn_down_exps_s = nullptr;
+                l.ffn_up_exps_s   = nullptr;
+            }
+        }
+    }
 
     llama_model_shared_host_views(layers, pimpl->ctx_shared_views, hdmd.rot, prec_policy, w_scales);
 

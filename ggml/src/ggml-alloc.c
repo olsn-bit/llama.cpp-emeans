@@ -1119,6 +1119,9 @@ static struct ggml_tensor ** ggml_backend_alloc_ctx_tensors_from_buft_collect(
         struct ggml_context * ctx, int * n_tensors) {
     int n = 0;
     for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->data != NULL) {
+            continue;
+        }
         n++;
     }
     *n_tensors = n;
@@ -1133,6 +1136,9 @@ static struct ggml_tensor ** ggml_backend_alloc_ctx_tensors_from_buft_collect(
     }
     int i = 0;
     for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->data != NULL) {
+            continue;
+        }
         tensors[i++] = t;
     }
     return tensors;

@@ -9,7 +9,11 @@
 #include <algorithm>
 #include <cmath>
 
+#if defined(__HIP_PLATFORM_AMD__)
+#define DEPTH_MIX_BLOCK 256
+#else
 #define DEPTH_MIX_BLOCK 1024
+#endif
 #define DEPTH_MIX_MAX_N 32
 #define DEPTH_MIX_MAX_NQ 3
 #define DEPTH_MIX_MAX_NCOLS 8192
@@ -31,7 +35,11 @@ struct depth_mix_params {
 };
 
 template <int nq>
+#if defined(__HIP_PLATFORM_AMD__)
+static __global__ void __launch_bounds__(DEPTH_MIX_BLOCK, 4) depth_mix_f32(const depth_mix_params p) {
+#else
 static __global__ void __launch_bounds__(DEPTH_MIX_BLOCK, 1) depth_mix_f32(const depth_mix_params p) {
+#endif
     extern __shared__ float4 depth_mix_smem[];
     float * normed = (float *) depth_mix_smem; // [ncols]
     __shared__ float red_mm[nq][DEPTH_MIX_BLOCK / WARP_SIZE];
