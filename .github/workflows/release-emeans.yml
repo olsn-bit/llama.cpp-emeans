@@ -1,0 +1,365 @@
+name: Release e-means (.emns)
+
+on:
+  push:
+    tags:
+      - 'v*-emeans*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag name (e.g. v0.1.0-emeans)'
+        required: true
+        default: 'v0.1.0-emeans'
+
+permissions:
+  contents: write
+
+env:
+  LLAMA_BUILD_TESTS: 'OFF'
+
+jobs:
+  windows-cpu:
+    name: windows-cpu (x64)
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Ninja & LLVM
+        run: |
+          choco install ninja llvm --version=22.1.8 -y
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+
+      - name: Build Windows x64 binaries (llama-server, llama-cli, llama-perplexity, CPU backend)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON
+          cmake --build build --config Release
+
+      - name: Pack Windows CPU binaries
+        run: |
+          Copy-Item LICENSE .\build\bin\Release\ -Force
+          7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-win-cpu-x64.zip
+          path: llama-bin-win-cpu-x64.zip
+          archive: false
+
+  windows-cuda:
+    name: windows-cuda (12.4, x64)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install CUDA Toolkit 12.4
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build ggml-cuda.dll
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Bundle CUDA runtime DLLs and pack
+        run: |
+          $dst = '.\build\bin\Release'
+          foreach ($src in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\lib", "$env:CUDA_PATH\bin\x64")) {
+            if (Test-Path $src) {
+              Get-ChildItem -Path $src -Include cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll -File -ErrorAction SilentlyContinue |
+                Copy-Item -Destination $dst -Force
+            }
+          }
+          7z a -snl llama-bin-win-cuda-12.4-x64.zip `
+            .\build\bin\Release\ggml-cuda.dll `
+            .\build\bin\Release\cudart64_*.dll `
+            .\build\bin\Release\cublas64_*.dll `
+            .\build\bin\Release\cublasLt64_*.dll
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-win-cuda-12.4-x64.zip
+          path: llama-bin-win-cuda-12.4-x64.zip
+          archive: false
+
+  windows-rocm:
+    name: windows-rocm (x64)
+    runs-on: windows-2022
+    env:
+      ROCM_VERSION: '10.0.0'
+      GPU_TARGETS: 'gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Setup ROCm
+        uses: ./.github/actions/windows-setup-rocm
+        with:
+          version: ${{ env.ROCM_VERSION }}
+
+      - name: Setup ROCm Environment
+        run: |
+          $ErrorActionPreference = "Stop"
+          & C:\TheRock\build\.venv\Scripts\Activate.ps1
+          rocm-sdk init
+          if ($LASTEXITCODE -ne 0) { throw "rocm-sdk init failed with exit code $LASTEXITCODE" }
+          $rocmPath = (rocm-sdk path --root).Trim()
+          $cmakePath = (rocm-sdk path --cmake).Trim()
+          $binPath = (rocm-sdk path --bin).Trim()
+          echo "HIP_PATH=$rocmPath" >> $env:GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=$cmakePath" >> $env:GITHUB_ENV
+          echo "HIP_DEVICE_LIB_PATH=$rocmPath\lib\llvm\amdgcn\bitcode" >> $env:GITHUB_ENV
+          echo "HIP_PLATFORM=amd" >> $env:GITHUB_ENV
+          echo "LLVM_PATH=$rocmPath\lib\llvm" >> $env:GITHUB_ENV
+          echo "$binPath" >> $env:GITHUB_PATH
+          echo "C:\TheRock\build\.venv\Scripts" >> $env:GITHUB_PATH
+
+      - name: Build ggml-hip.dll
+        run: |
+          cmake -S . -B build `
+            -G "Ninja Multi-Config" `
+            -DCMAKE_PREFIX_PATH="${env:HIP_PATH}" `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_CPU=OFF `
+            -DGGML_HIP=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DCMAKE_C_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang++.exe" `
+            -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types" `
+            -DCMAKE_HIP_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+            -DHIP_PATH="${env:HIP_PATH}" `
+            -DAMDGPU_TARGETS="${env:GPU_TARGETS}"
+          cmake --build build --config Release --parallel ${env:NUMBER_OF_PROCESSORS} --target ggml-hip
+
+      - name: Bundle HIP runtime DLLs and pack
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hipDll = Get-ChildItem -Path build\bin\Release -Filter "ggml-hip*.dll" -ErrorAction SilentlyContinue
+          if (-not $hipDll) { throw "ggml-hip.dll was not produced" }
+          $binPath = (rocm-sdk path --bin).Trim()
+          foreach ($pattern in @("amdhip64_7.dll", "rocm_kpack.dll", "amd_comgr.dll")) {
+            Get-ChildItem -Path $binPath -Filter $pattern -ErrorAction SilentlyContinue |
+              Copy-Item -Destination build\bin\Release -Force
+          }
+          7z a -snl llama-bin-win-rocm-x64.zip `
+            .\build\bin\Release\ggml-hip.dll `
+            .\build\bin\Release\amdhip64_7.dll `
+            .\build\bin\Release\rocm_kpack.dll `
+            .\build\bin\Release\amd_comgr.dll
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-win-rocm-x64.zip
+          path: llama-bin-win-rocm-x64.zip
+          archive: false
+
+  ubuntu-cuda:
+    name: ubuntu-cuda (12.8, x64)
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.2-devel-ubuntu24.04
+    steps:
+      - name: Install git & build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git build-essential cmake ninja-build libssl-dev
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Pack with bundled CUDA runtime
+        run: |
+          cp LICENSE ./build/bin/
+          cp -L /usr/local/cuda/lib64/libcudart.so.12 ./build/bin/
+          cp -L /usr/local/cuda/lib64/libcublas.so.12 ./build/bin/
+          cp -L /usr/local/cuda/lib64/libcublasLt.so.12 ./build/bin/
+          tar -czvf llama-bin-ubuntu-cuda-12.8-x64.tar.gz -C ./build/bin .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-ubuntu-cuda-12.8-x64.tar.gz
+          path: llama-bin-ubuntu-cuda-12.8-x64.tar.gz
+          archive: false
+
+  ubuntu-rocm:
+    name: ubuntu-rocm (x64)
+    runs-on: ubuntu-24.04
+    env:
+      ROCM_VERSION: '10.0.0'
+      GPU_TARGETS: 'gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Free disk space
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential git cmake ninja-build wget
+
+      - name: Setup ROCm
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,devel]==${ROCM_VERSION}"
+          ROCM_PATH=$(rocm-sdk path --root)
+          CMAKE_PATH=$(rocm-sdk path --cmake)
+          BIN_PATH=$(rocm-sdk path --bin)
+          echo "ROCM_PATH=$ROCM_PATH" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$CMAKE_PATH" >> "$GITHUB_ENV"
+          echo "HIP_PATH=$ROCM_PATH" >> "$GITHUB_ENV"
+          echo "PATH=$BIN_PATH:${PATH}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          cmake -B build -S . -G Ninja \
+            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGPU_TARGETS="${GPU_TARGETS}" \
+            -DGGML_HIP=ON \
+            -DHIP_PLATFORM=amd \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Pack
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-bin-ubuntu-rocm-x64.tar.gz -C ./build/bin .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-ubuntu-rocm-x64.tar.gz
+          path: llama-bin-ubuntu-rocm-x64.tar.gz
+          archive: false
+
+  publish:
+    name: Publish GitHub Release
+    needs: [windows-cpu, windows-cuda, windows-rocm, ubuntu-cuda, ubuntu-rocm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ./artifact
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: Merge Windows CPU binaries into CUDA and ROCm zips
+        run: |
+          mkdir -p release
+          TAG="${{ steps.tag.outputs.name }}"
+
+          temp_dir=$(mktemp -d)
+          unzip -q artifact/llama-bin-win-cpu-x64.zip -d "$temp_dir"
+
+          for backend in cuda-12.4 rocm; do
+            src_zip="artifact/llama-bin-win-${backend}-x64.zip"
+            out_zip="release/llama-emeans-${TAG}-win-${backend}-x64.zip"
+            cp "$src_zip" "$out_zip"
+            out_real=$(realpath "$out_zip")
+            (cd "$temp_dir" && zip -q -r "$out_real" .)
+          done
+          rm -rf "$temp_dir"
+
+          mv artifact/llama-bin-ubuntu-cuda-12.8-x64.tar.gz "release/llama-emeans-${TAG}-ubuntu-cuda-12.8-x64.tar.gz"
+          mv artifact/llama-bin-ubuntu-rocm-x64.tar.gz "release/llama-emeans-${TAG}-ubuntu-rocm-x64.tar.gz"
+
+          ls -lh release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: "llama.cpp-emeans ${{ steps.tag.outputs.name }}"
+          draft: false
+          prerelease: false
+          files: release/*
+          body: |
+            Prebuilt `llama.cpp` binaries with **e-means (`.emns`)** HIP/CUDA kernels, WMMA prefill, and 4-bit vision loader support.
+
+            ### Downloads
+            - **Windows (NVIDIA CUDA 12.4):** `llama-emeans-${{ steps.tag.outputs.name }}-win-cuda-12.4-x64.zip` *(CUDA runtime DLLs included)*
+            - **Windows (AMD ROCm / HIP):** `llama-emeans-${{ steps.tag.outputs.name }}-win-rocm-x64.zip` *(RDNA 1–4 `gfx1010–gfx1201`, HIP runtime DLLs included)*
+            - **Linux (Ubuntu NVIDIA CUDA 12.8):** `llama-emeans-${{ steps.tag.outputs.name }}-ubuntu-cuda-12.8-x64.tar.gz` *(CUDA runtime `.so` included)*
+            - **Linux (Ubuntu AMD ROCm / HIP):** `llama-emeans-${{ steps.tag.outputs.name }}-ubuntu-rocm-x64.tar.gz`
+
+            ### Quick Start
+            Unzip, set `EMEANS_MODEL` to your `.emns` file, and launch `llama-server` with the metadata stub GGUF:
+            ```powershell
+            $env:EMEANS_MODEL = "Inkling-2-Mini-3.04bpw-12GB.emns"
+            .\llama-server.exe -m Inkling-2-Mini-metadata-stub.gguf -ngl 99 -c 32768 --port 8090
+            ```
