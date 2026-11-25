@@ -183,38 +183,57 @@ jobs:
           $sdkDirs = @((Split-Path $binPath -Parent)) + (Get-ChildItem -Path $rocmSite -Directory -Filter "_rocm_sdk*" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) | Select-Object -Unique
           $searchBinDirs = $sdkDirs | ForEach-Object { Join-Path $_ "bin" } | Where-Object { Test-Path $_ } | Select-Object -Unique
 
-          $requiredDlls = @(
-            "amdhip64_7.dll",
-            "rocm_kpack.dll",
-            "amd_comgr.dll",
-            "hipblas.dll",
-            "rocblas.dll",
-            "rocsolver.dll",
-            "libhipblaslt.dll",
-            "libtensilelite-host.dll",
-            "origami.dll"
-          )
-          foreach ($dll in $requiredDlls) {
-            $found = $null
-            foreach ($dir in $searchBinDirs) {
-              $cand = Join-Path $dir $dll
-              if (Test-Path $cand) { $found = $cand; break }
+          # Dynamically walk PE imports of ggml-hip.dll (transitive) so bundling works across ROCm 7.x and 10.x
+          $objdump = Join-Path $env:HIP_PATH "lib\llvm\bin\llvm-objdump.exe"
+          if (-not (Test-Path $objdump)) { throw "llvm-objdump.exe not found at $objdump" }
+          $queue = New-Object System.Collections.Generic.Queue[string]
+          $visited = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+          $foundMap = @{}
+          $queue.Enqueue((Resolve-Path ".\build\bin\Release\ggml-hip.dll").Path)
+          while ($queue.Count -gt 0) {
+            $cur = $queue.Dequeue()
+            $out = & $objdump -p $cur 2>$null
+            foreach ($line in $out) {
+              if ($line -match '^\s*DLL Name:\s+(\S+\.dll)\s*$') {
+                $dep = $Matches[1]
+                if ($visited.Add($dep)) {
+                  foreach ($dir in $searchBinDirs) {
+                    $cand = Join-Path $dir $dep
+                    if (Test-Path $cand) {
+                      $foundMap[$dep] = $cand
+                      $queue.Enqueue($cand)
+                      break
+                    }
+                  }
+                }
+              }
             }
-            if (-not $found) {
-              throw "Required ROCm runtime DLL not found: $dll (searched: $($searchBinDirs -join ', '))"
+          }
+          # Include dynamically loaded amd_comgr*.dll if present in ROCm bin dirs
+          foreach ($dir in $searchBinDirs) {
+            Get-ChildItem -Path $dir -Filter "amd_comgr*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object {
+              if (-not $foundMap.ContainsKey($_.Name)) { $foundMap[$_.Name] = $_.FullName }
             }
-            Copy-Item -Path $found -Destination $stageBin -Force
+          }
+          if ($foundMap.Count -lt 4) {
+            throw "Too few ROCm runtime DLLs discovered ($($foundMap.Count)) in: $($searchBinDirs -join ', ')"
+          }
+          Write-Host "Bundling $($foundMap.Count) ROCm runtime DLLs: $(($foundMap.Keys | Sort-Object) -join ', ')"
+          foreach ($kv in $foundMap.GetEnumerator()) {
+            Copy-Item -Path $kv.Value -Destination $stageBin -Force
           }
 
           # Copy rocblas/library and .kpack/blas_lib_*.kpack for targeted RDNA archs (required by rocblas.dll without ROCm in PATH)
           $targetRegex = ($env:GPU_TARGETS -split ';') -join '|'
-          foreach ($dir in $searchBinDirs) {
-            $rbSrc = Join-Path $dir "rocblas\library"
-            if (Test-Path $rbSrc) {
-              Get-ChildItem -Path $rbSrc -File | Where-Object {
-                ($_.Name -match $targetRegex) -or ($_.Name -match 'generic') -or ($_.Name -notmatch 'gfx\d+')
-              } | ForEach-Object {
-                Copy-Item -Path $_.FullName -Destination $stageRbLib -Force
+          foreach ($dir in $sdkDirs) {
+            foreach ($sub in @("bin\rocblas\library", "lib\rocblas\library")) {
+              $rbSrc = Join-Path $dir $sub
+              if (Test-Path $rbSrc) {
+                Get-ChildItem -Path $rbSrc -File | Where-Object {
+                  ($_.Name -match $targetRegex) -or ($_.Name -match 'generic') -or ($_.Name -notmatch 'gfx\d+')
+                } | ForEach-Object {
+                  Copy-Item -Path $_.FullName -Destination $stageRbLib -Force
+                }
               }
             }
           }
@@ -423,9 +442,10 @@ jobs:
 
             ### Quick Start (3 Steps)
             1. **Download & unzip** the archive for your OS/GPU, plus `Inkling-2-Mini-metadata-stub.gguf` and an `.emns` weight file (`Inkling-2-Mini-3.04bpw.emns` for 12 GB+ VRAM, or `Inkling-2-Mini-2.27bpw.emns` for 8 GB VRAM).
-            2. **Set `EMEANS_MODEL` and start `llama-server`** *(use `.\bin\llama-server.exe` on Windows ROCm)*:
+            2. **Set `EMEANS_MODEL` and start `llama-server`** *(single line — paste as-is; use `.\bin\llama-server.exe` on Windows ROCm)*:
                ```powershell
                $env:EMEANS_MODEL = "Inkling-2-Mini-3.04bpw.emns"
-               .\llama-server.exe -m Inkling-2-Mini-metadata-stub.gguf -ngl 99 -c 53248 -ub 128 -fa on -ctk q4_0 -ctv q4_0 --fit off --port 8080
+               .\llama-server.exe -m Inkling-2-Mini-metadata-stub.gguf -a Inkling-2-Mini-EMEANS -ngl 99 -np 1 -c 32768 -ub 128 -fa on -ctk q4_0 -ctv q4_0 --fit off --port 8080
                ```
+               *(Start with `-c 32768` when browsers/IDEs are open to avoid VRAM spill; raise to `-c 53248` on a clean 12 GB desktop.)*
             3. **Open `http://127.0.0.1:8080`** in your browser (or connect any OpenAI-compatible client to `http://127.0.0.1:8080/v1`).
