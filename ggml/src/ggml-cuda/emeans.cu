@@ -559,7 +559,11 @@ typedef float em_gacc_t;
 static __device__ __forceinline__ em_gacc_t em_gacc_zero() { return 0.0f; }
 static __device__ __forceinline__ em_gacc_t em_gacc_fdot2(uint32_t a_bits, uint32_t b_bits, em_gacc_t acc) {
     union { uint32_t u; em_f16x2_t v; } ua{a_bits}, ub{b_bits};
+#if !defined(__gfx1010__) && !defined(__gfx1011__) && !defined(__gfx1012__) && !defined(__gfx900__) && !defined(__gfx906__)
     return __builtin_amdgcn_fdot2(ua.v, ub.v, acc, false);
+#else
+    return fmaf((float)ua.v[0], (float)ub.v[0], fmaf((float)ua.v[1], (float)ub.v[1], acc));
+#endif
 }
 static __device__ __forceinline__ float em_gacc_to_f32(em_gacc_t acc) { return acc; }
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 530
