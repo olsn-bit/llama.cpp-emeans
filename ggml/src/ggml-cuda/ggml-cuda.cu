@@ -2357,6 +2357,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, cons
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (ggml_cuda_emeans_has(src0) || (gate && ggml_cuda_emeans_has(gate->src[0]))) {
+        return false;
+    }
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -2389,6 +2393,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    if (ggml_cuda_emeans_has(src0)) {
+        return false;
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -2547,6 +2555,9 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
 
 static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu,
         const ggml_tensor * up_scale = nullptr, const ggml_tensor * gate_scale = nullptr) {
+    if (ggml_cuda_emeans_has(up->src[0]) || ggml_cuda_emeans_has(gate->src[0])) {
+        return false;
+    }
     // A hinted matmul can be fused, but its unfused path may be faster (e.g. FWHT for GGML_HINT_SRC0_IS_HADAMARD).
     if (ggml_get_op_params_i32(up, 1) != GGML_HINT_NONE || ggml_get_op_params_i32(gate, 1) != GGML_HINT_NONE) {
         return false;
@@ -4798,7 +4809,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
-            ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
+            ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1]) &&
+            !ggml_cuda_emeans_has(cgraph->nodes[i + 2]->src[0]->src[0]) &&
+            !ggml_cuda_emeans_has(cgraph->nodes[i + 5]->src[1]->src[0]) &&
+            !ggml_cuda_emeans_has(cgraph->nodes[i + 5]->src[0]->src[0])) {
         const int outputs[] = { i + 2, i + 5 };
         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 2)) {
             ggml_tensor * routed = cgraph->nodes[i + 2];

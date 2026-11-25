@@ -277,6 +277,7 @@ extern "C" {
 
 bool ggml_cuda_emeans_init(const char * emns_path) {
     if (!emns_path || !emns_path[0]) return false;
+    try {
     auto & st = emns_state();
     std::lock_guard<std::mutex> lock(st.mtx);
     if (st.loaded && st.loaded_path == emns_path) {
@@ -291,7 +292,7 @@ bool ggml_cuda_emeans_init(const char * emns_path) {
     char magic[8];
     uint64_t manifest_len = 0;
     if (fread(magic, 1, 8, f) != 8 || memcmp(magic, EMNS_MAGIC, 8) != 0 ||
-        fread(&manifest_len, 8, 1, f) != 1) {
+        fread(&manifest_len, 8, 1, f) != 1 || manifest_len == 0 || manifest_len > (64ULL << 20)) {
         fprintf(stderr, "[emeans] ERROR: invalid .emns header in '%s'\n", emns_path);
         fclose(f);
         return false;
@@ -305,21 +306,41 @@ bool ggml_cuda_emeans_init(const char * emns_path) {
     uint64_t data_base = (hdr_end + 63ULL) & ~63ULL;
 #if defined(_WIN32)
     _fseeki64(f, 0, SEEK_END);
-    uint64_t file_size = (uint64_t)_ftelli64(f);
+    int64_t raw_size = _ftelli64(f);
     _fseeki64(f, (long long)data_base, SEEK_SET);
 #else
     fseeko(f, 0, SEEK_END);
-    uint64_t file_size = (uint64_t)ftello(f);
+    int64_t raw_size = (int64_t)ftello(f);
     fseeko(f, (off_t)data_base, SEEK_SET);
 #endif
-    uint64_t data_bytes = file_size - data_base;
+    if (raw_size <= 0 || (uint64_t)raw_size <= data_base) {
+        fprintf(stderr, "[emeans] ERROR: truncated .emns file '%s'\n", emns_path);
+        fclose(f);
+        return false;
+    }
+    uint64_t data_bytes = (uint64_t)raw_size - data_base;
 
-    st.tensors.clear();
-    if (!em_parse_manifest(mjson, st.tensors)) {
+    std::unordered_map<std::string, EmTensor> parsed_tensors;
+    if (!em_parse_manifest(mjson, parsed_tensors)) {
         fprintf(stderr, "[emeans] ERROR: failed to parse manifest\n");
         fclose(f);
         return false;
     }
+    for (const auto & kv : parsed_tensors) {
+        for (const auto & pk : kv.second.planes) {
+            if (pk.second.offset > data_bytes || pk.second.nbytes > data_bytes - pk.second.offset) {
+                fprintf(stderr, "[emeans] ERROR: plane '%s.%s' out of bounds (off=%llu, nbytes=%llu, data=%llu)\n",
+                        kv.first.c_str(), pk.first.c_str(),
+                        (unsigned long long)pk.second.offset,
+                        (unsigned long long)pk.second.nbytes,
+                        (unsigned long long)data_bytes);
+                fclose(f);
+                return false;
+            }
+        }
+    }
+
+    st.tensors = std::move(parsed_tensors);
 
     if (st.d_blob) { hipFree(st.d_blob); st.d_blob = nullptr; }
     hipError_t err = hipMalloc(&st.d_blob, data_bytes);
@@ -368,6 +389,10 @@ bool ggml_cuda_emeans_init(const char * emns_path) {
     fprintf(stderr, "[emeans] Loaded '%s': %.4f GiB (%zu tensors) into contiguous HIP VRAM\n",
             emns_path, data_bytes / 1073741824.0, st.tensors.size());
     return true;
+    } catch (...) {
+        fprintf(stderr, "[emeans] ERROR: unexpected exception in ggml_cuda_emeans_init\n");
+        return false;
+    }
 }
 
 #ifdef _WIN32
@@ -375,6 +400,7 @@ __declspec(dllexport)
 #endif
 bool ggml_cuda_emeans_init_extra(const char * emns_path) {
     if (!emns_path || !emns_path[0]) return false;
+    try {
     auto & st = emns_state();
     std::lock_guard<std::mutex> lock(st.mtx);
     for (const auto & p : st.extra_paths) {
@@ -389,7 +415,7 @@ bool ggml_cuda_emeans_init_extra(const char * emns_path) {
     char magic[8];
     uint64_t manifest_len = 0;
     if (fread(magic, 1, 8, f) != 8 || memcmp(magic, EMNS_MAGIC, 8) != 0 ||
-        fread(&manifest_len, 8, 1, f) != 1) {
+        fread(&manifest_len, 8, 1, f) != 1 || manifest_len == 0 || manifest_len > (64ULL << 20)) {
         fprintf(stderr, "[emeans] ERROR: invalid .emns header in '%s'\n", emns_path);
         fclose(f);
         return false;
@@ -403,20 +429,35 @@ bool ggml_cuda_emeans_init_extra(const char * emns_path) {
     uint64_t data_base = (hdr_end + 63ULL) & ~63ULL;
 #if defined(_WIN32)
     _fseeki64(f, 0, SEEK_END);
-    uint64_t file_size = (uint64_t)_ftelli64(f);
+    int64_t raw_size = _ftelli64(f);
     _fseeki64(f, (long long)data_base, SEEK_SET);
 #else
     fseeko(f, 0, SEEK_END);
-    uint64_t file_size = (uint64_t)ftello(f);
+    int64_t raw_size = (int64_t)ftello(f);
     fseeko(f, (off_t)data_base, SEEK_SET);
 #endif
-    uint64_t data_bytes = file_size - data_base;
+    if (raw_size <= 0 || (uint64_t)raw_size <= data_base) {
+        fprintf(stderr, "[emeans] ERROR: truncated extra .emns file '%s'\n", emns_path);
+        fclose(f);
+        return false;
+    }
+    uint64_t data_bytes = (uint64_t)raw_size - data_base;
 
     std::unordered_map<std::string, EmTensor> extra_tensors;
     if (!em_parse_manifest(mjson, extra_tensors)) {
         fprintf(stderr, "[emeans] ERROR: failed to parse extra manifest\n");
         fclose(f);
         return false;
+    }
+    for (const auto & kv : extra_tensors) {
+        for (const auto & pk : kv.second.planes) {
+            if (pk.second.offset > data_bytes || pk.second.nbytes > data_bytes - pk.second.offset) {
+                fprintf(stderr, "[emeans] ERROR: extra plane '%s.%s' out of bounds\n",
+                        kv.first.c_str(), pk.first.c_str());
+                fclose(f);
+                return false;
+            }
+        }
     }
 
     uint8_t * d_extra = nullptr;
@@ -468,6 +509,10 @@ bool ggml_cuda_emeans_init_extra(const char * emns_path) {
     fprintf(stderr, "[emeans] Loaded extra '%s': %.2f MiB (%zu quantized tensors) into HIP VRAM\n",
             emns_path, data_bytes / 1048576.0, n_added);
     return true;
+    } catch (...) {
+        fprintf(stderr, "[emeans] ERROR: unexpected exception in ggml_cuda_emeans_init_extra\n");
+        return false;
+    }
 }
 
 ggml_backend_buffer_t ggml_cuda_emeans_get_stub_buffer(ggml_backend_buffer_type_t buft) {
@@ -499,6 +544,49 @@ void * ggml_cuda_emeans_bind_tensor(const char * gguf_name, int64_t ne0, int64_t
     // Only bind quantized formats (EM1D_Q4_G64, EM1D_Q3_G64, EM2D_K32_G128, EM2D_K16_G128)
     if (em.fmt != EM_FMT_EM1D_Q4_G64 && em.fmt != EM_FMT_EM1D_Q3_G64 &&
         em.fmt != EM_FMT_EM2D_K32_G128 && em.fmt != EM_FMT_EM2D_K16_G128) {
+        return nullptr;
+    }
+    // 2D matmul path only implements EM1D_Q4_G64
+    if (em.shape.size() == 2 && em.fmt != EM_FMT_EM1D_Q4_G64) {
+        fprintf(stderr, "[emeans] WARN: unsupported 2D fmt=%u for %s\n", em.fmt, gguf_name);
+        return nullptr;
+    }
+    // Verify K divisibility required by kernels (64 for 1D, 128 for 2D)
+    const int64_t k_align = (em.fmt == EM_FMT_EM1D_Q4_G64 || em.fmt == EM_FMT_EM1D_Q3_G64) ? 64 : 128;
+    if (ne0 <= 0 || (ne0 % k_align) != 0) {
+        fprintf(stderr, "[emeans] WARN: K=%lld not divisible by %lld for %s\n",
+                (long long)ne0, (long long)k_align, gguf_name);
+        return nullptr;
+    }
+    // Verify required planes exist and are non-null
+    auto has_plane = [&](const char * pname, uint64_t min_bytes) -> bool {
+        auto pit = em.planes.find(pname);
+        return pit != em.planes.end() && pit->second.d_ptr != nullptr && pit->second.nbytes >= min_bytes;
+    };
+    const uint64_t n_rows_total = (uint64_t)ne1 * (uint64_t)ne2;
+    const uint64_t k_u64 = (uint64_t)ne0;
+    bool planes_ok = false;
+    if (em.fmt == EM_FMT_EM1D_Q4_G64) {
+        planes_ok = has_plane("lo4", n_rows_total * (k_u64 / 2)) &&
+                    has_plane("scales", n_rows_total * (k_u64 / 64) * 2) &&
+                    has_plane("lut", (uint64_t)ne2 * 16 * 2);
+    } else if (em.fmt == EM_FMT_EM1D_Q3_G64) {
+        planes_ok = has_plane("lo2", n_rows_total * (k_u64 / 4)) &&
+                    has_plane("hi1", n_rows_total * (k_u64 / 8)) &&
+                    has_plane("scales", n_rows_total * (k_u64 / 64) * 2) &&
+                    has_plane("lut", (uint64_t)ne2 * 8 * 2);
+    } else if (em.fmt == EM_FMT_EM2D_K32_G128) {
+        planes_ok = has_plane("lo4", n_rows_total * (k_u64 / 4)) &&
+                    has_plane("hi1", n_rows_total * (k_u64 / 16)) &&
+                    has_plane("scales", n_rows_total * (k_u64 / 128) * 2) &&
+                    has_plane("lut", (uint64_t)ne2 * 32 * 4);
+    } else if (em.fmt == EM_FMT_EM2D_K16_G128) {
+        planes_ok = has_plane("lo4", n_rows_total * (k_u64 / 4)) &&
+                    has_plane("scales", n_rows_total * (k_u64 / 128) * 2) &&
+                    has_plane("lut", (uint64_t)ne2 * 16 * 4);
+    }
+    if (!planes_ok) {
+        fprintf(stderr, "[emeans] WARN: missing/truncated planes for %s (fmt=%u)\n", gguf_name, em.fmt);
         return nullptr;
     }
     // Verify shape match (GGML [K, N, E] vs EMNS [N, K] or [E, N, K])
@@ -1222,14 +1310,17 @@ void em_gemm8_q3_g64_moe_kernel(
                 wh2[p] = em_pack_h16(EM_SHFL(my_lut, i0, 32), EM_SHFL(my_lut, i1, 32));
             }
             if (valid) {
-                for (int b = 0; b < cnt; ++b) {
-                    const uint4 xw = x_u4[s_xbase[b] + xb + w];
-                    em_gacc_t gb = gv[b];
-                    gb = em_gacc_fdot2(wh2[0], xw.x, gb);
-                    gb = em_gacc_fdot2(wh2[1], xw.y, gb);
-                    gb = em_gacc_fdot2(wh2[2], xw.z, gb);
-                    gb = em_gacc_fdot2(wh2[3], xw.w, gb);
-                    gv[b] = gb;
+                #pragma unroll
+                for (int b = 0; b < 8; ++b) {
+                    if (b < cnt) {
+                        const uint4 xw = x_u4[s_xbase[b] + xb + w];
+                        em_gacc_t gb = gv[b];
+                        gb = em_gacc_fdot2(wh2[0], xw.x, gb);
+                        gb = em_gacc_fdot2(wh2[1], xw.y, gb);
+                        gb = em_gacc_fdot2(wh2[2], xw.z, gb);
+                        gb = em_gacc_fdot2(wh2[3], xw.w, gb);
+                        gv[b] = gb;
+                    }
                 }
             }
         }
@@ -1336,14 +1427,17 @@ void em_gemm8_2d_k32_g128_moe_kernel(
                 wh2[p] = EM_SHFL(my_lut, idx, 32);
             }
             if (valid) {
-                for (int b = 0; b < cnt; ++b) {
-                    const uint4 xw = x_u4[s_xbase[b] + xb + w];
-                    em_gacc_t gb = gv[b];
-                    gb = em_gacc_fdot2(wh2[0], xw.x, gb);
-                    gb = em_gacc_fdot2(wh2[1], xw.y, gb);
-                    gb = em_gacc_fdot2(wh2[2], xw.z, gb);
-                    gb = em_gacc_fdot2(wh2[3], xw.w, gb);
-                    gv[b] = gb;
+                #pragma unroll
+                for (int b = 0; b < 8; ++b) {
+                    if (b < cnt) {
+                        const uint4 xw = x_u4[s_xbase[b] + xb + w];
+                        em_gacc_t gb = gv[b];
+                        gb = em_gacc_fdot2(wh2[0], xw.x, gb);
+                        gb = em_gacc_fdot2(wh2[1], xw.y, gb);
+                        gb = em_gacc_fdot2(wh2[2], xw.z, gb);
+                        gb = em_gacc_fdot2(wh2[3], xw.w, gb);
+                        gv[b] = gb;
+                    }
                 }
             }
         }
@@ -1367,7 +1461,7 @@ void em_gemm8_2d_k32_g128_moe_kernel(
     }
 }
 
-__global__ EM_LAUNCH_BOUNDS_GEMV
+__global__ EM_LAUNCH_BOUNDS
 void em_gemm8_2d_k16_g128_moe_kernel(
     const uint32_t * __restrict__ lo4_all,
     const __half   * __restrict__ scales_all,
@@ -1444,14 +1538,17 @@ void em_gemm8_2d_k16_g128_moe_kernel(
                 wh2[p] = EM_SHFL(my_lut, idx, 32);
             }
             if (valid) {
-                for (int b = 0; b < cnt; ++b) {
-                    const uint4 xw = x_u4[s_xbase[b] + xb + w];
-                    em_gacc_t gb = gv[b];
-                    gb = em_gacc_fdot2(wh2[0], xw.x, gb);
-                    gb = em_gacc_fdot2(wh2[1], xw.y, gb);
-                    gb = em_gacc_fdot2(wh2[2], xw.z, gb);
-                    gb = em_gacc_fdot2(wh2[3], xw.w, gb);
-                    gv[b] = gb;
+                #pragma unroll
+                for (int b = 0; b < 8; ++b) {
+                    if (b < cnt) {
+                        const uint4 xw = x_u4[s_xbase[b] + xb + w];
+                        em_gacc_t gb = gv[b];
+                        gb = em_gacc_fdot2(wh2[0], xw.x, gb);
+                        gb = em_gacc_fdot2(wh2[1], xw.y, gb);
+                        gb = em_gacc_fdot2(wh2[2], xw.z, gb);
+                        gb = em_gacc_fdot2(wh2[3], xw.w, gb);
+                        gv[b] = gb;
+                    }
                 }
             }
         }
@@ -1570,11 +1667,11 @@ void em_gemm16_wmma_q3_g64_moe_kernel(
 
     __shared__ uint32_t s_pairs[16];
     __shared__ size_t   s_xbase[16];
-    alignas(16) __shared__ union {
+    alignas(32) __shared__ union {
         uint16_t w[128][40];
         float    c[8][256];
     } s_mem;
-    alignas(16) __shared__ uint16_t s_X[16][40];
+    alignas(32) __shared__ uint16_t s_X[16][40];
 
     if (tid < cnt) {
         const uint32_t pr = sorted_pairs[pstart + tid];
@@ -1709,11 +1806,11 @@ void em_gemm16_wmma_2d_k32_g128_moe_kernel(
 
     __shared__ uint32_t s_pairs[16];
     __shared__ size_t   s_xbase[16];
-    alignas(16) __shared__ union {
+    alignas(32) __shared__ union {
         uint16_t w[128][40];
         float    c[8][256];
     } s_mem;
-    alignas(16) __shared__ uint16_t s_X[16][40];
+    alignas(32) __shared__ uint16_t s_X[16][40];
 
     if (tid < cnt) {
         const uint32_t pr = sorted_pairs[pstart + tid];
@@ -1846,11 +1943,11 @@ void em_gemm16_wmma_2d_k16_g128_moe_kernel(
 
     __shared__ uint32_t s_pairs[16];
     __shared__ size_t   s_xbase[16];
-    alignas(16) __shared__ union {
+    alignas(32) __shared__ union {
         uint16_t w[128][40];
         float    c[8][256];
     } s_mem;
-    alignas(16) __shared__ uint16_t s_X[16][40];
+    alignas(32) __shared__ uint16_t s_X[16][40];
 
     if (tid < cnt) {
         const uint32_t pr = sorted_pairs[pstart + tid];

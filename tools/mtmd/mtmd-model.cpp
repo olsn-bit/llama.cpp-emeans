@@ -33,6 +33,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <dlfcn.h>
 #endif
 
 // --- Minimal E-Means Vision (.emns) Loader Helpers (GPU stub-bind + CPU 4-bit dequant) ---
@@ -57,6 +59,13 @@ struct mtmd_emns_gpu_api {
             api.get_buf    = reinterpret_cast<get_buf_fn>(GetProcAddress(mod, "ggml_cuda_emeans_get_stub_buffer"));
             api.bind       = reinterpret_cast<bind_fn>(GetProcAddress(mod, "ggml_cuda_emeans_bind_tensor"));
         }
+#else
+        void * mod = dlopen("libggml-cuda.so", RTLD_LAZY | RTLD_NOLOAD);
+        if (!mod) mod = dlopen("libggml-hip.so", RTLD_LAZY | RTLD_NOLOAD);
+        void * handle = mod ? mod : RTLD_DEFAULT;
+        api.init_extra = reinterpret_cast<init_extra_fn>(dlsym(handle, "ggml_cuda_emeans_init_extra"));
+        api.get_buf    = reinterpret_cast<get_buf_fn>(dlsym(handle, "ggml_cuda_emeans_get_stub_buffer"));
+        api.bind       = reinterpret_cast<bind_fn>(dlsym(handle, "ggml_cuda_emeans_bind_tensor"));
 #endif
         return api;
     }

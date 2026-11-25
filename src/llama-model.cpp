@@ -2389,11 +2389,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     {
         const char * emns_env_sc = std::getenv("EMEANS_MODEL");
         if (emns_env_sc && emns_env_sc[0]) {
-            w_scales.clear();
-            for (auto & l : layers) {
-                l.ffn_gate_exps_s = nullptr;
-                l.ffn_down_exps_s = nullptr;
-                l.ffn_up_exps_s   = nullptr;
+            auto & em_api = llama_emeans_api::get();
+            if (em_api.ok()) {
+                bool any_stub = false;
+                for (auto & l : layers) {
+                    if (l.ffn_gate_exps && em_api.is_stub(l.ffn_gate_exps->data)) { l.ffn_gate_exps_s = nullptr; any_stub = true; }
+                    if (l.ffn_down_exps && em_api.is_stub(l.ffn_down_exps->data)) { l.ffn_down_exps_s = nullptr; any_stub = true; }
+                    if (l.ffn_up_exps   && em_api.is_stub(l.ffn_up_exps->data))   { l.ffn_up_exps_s   = nullptr; any_stub = true; }
+                }
+                if (any_stub) {
+                    for (auto it = w_scales.begin(); it != w_scales.end(); ) {
+                        if (it->first && em_api.is_stub(it->first->data)) {
+                            it = w_scales.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
             }
         }
     }
