@@ -223,38 +223,35 @@ jobs:
             Copy-Item -Path $kv.Value -Destination $stageBin -Force
           }
 
-          # Copy rocblas/library and .kpack/blas_lib_*.kpack for targeted RDNA archs (required by rocblas.dll without ROCm in PATH)
+          # Copy rocblas/library, hipblaslt/library, and .kpack files for targeted RDNA archs (works across ROCm 7.x and 10.x layouts)
           $targetRegex = ($env:GPU_TARGETS -split ';') -join '|'
-          foreach ($dir in $sdkDirs) {
-            foreach ($sub in @("bin\rocblas\library", "lib\rocblas\library")) {
-              $rbSrc = Join-Path $dir $sub
-              if (Test-Path $rbSrc) {
-                Get-ChildItem -Path $rbSrc -File | Where-Object {
-                  ($_.Name -match $targetRegex) -or ($_.Name -match 'generic') -or ($_.Name -notmatch 'gfx\d+')
-                } | ForEach-Object {
-                  Copy-Item -Path $_.FullName -Destination $stageRbLib -Force
-                }
-              }
+          $rbDirs = Get-ChildItem -Path $rocmSite -Directory -Recurse -Filter "rocblas" -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName "library" } | Where-Object { Test-Path $_ } | Select-Object -Unique
+          foreach ($rbSrc in $rbDirs) {
+            Get-ChildItem -Path $rbSrc -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
+              ($_.Name -match $targetRegex) -or ($_.Name -match 'generic') -or ($_.Name -notmatch 'gfx\d+')
+            } | ForEach-Object {
+              Copy-Item -Path $_.FullName -Destination $stageRbLib -Force
             }
           }
           $rbStaged = (Get-ChildItem -Path $stageRbLib -File -ErrorAction SilentlyContinue).Count
-          if ($rbStaged -eq 0) { throw "No rocblas/library files found for targets $($env:GPU_TARGETS)" }
 
-          foreach ($dir in $sdkDirs) {
-            $kpSrc = Join-Path $dir ".kpack"
-            if (Test-Path $kpSrc) {
-              Get-ChildItem -Path $kpSrc -Filter "blas_lib_*.kpack" -File | Where-Object {
-                $_.Name -match $targetRegex
-              } | ForEach-Object {
-                Copy-Item -Path $_.FullName -Destination $stageKpack -Force
-              }
-            }
+          $kpFiles = Get-ChildItem -Path $rocmSite -Filter "*.kpack" -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
+            ($_.Name -match $targetRegex) -or ($_.Name -notmatch 'gfx\d+')
+          }
+          foreach ($kp in $kpFiles) {
+            Copy-Item -Path $kp.FullName -Destination $stageKpack -Force
           }
           $kpStaged = (Get-ChildItem -Path $stageKpack -File -ErrorAction SilentlyContinue).Count
-          Write-Host "Bundled $rbStaged rocblas/library files and $kpStaged blas_lib .kpack files"
+          Write-Host "Bundled $($foundMap.Count) DLLs, $rbStaged rocblas/library files (from $($rbDirs.Count) dirs), and $kpStaged .kpack files"
+          if ($rbStaged -eq 0 -and $kpStaged -eq 0) {
+            Write-Warning "No rocblas/library or .kpack files matched targets $($env:GPU_TARGETS) under $rocmSite (continuing with bundled DLLs)"
+          }
 
           Push-Location $stageRoot
-          7z a -snl ..\llama-bin-win-rocm-x64.zip bin .kpack
+          $packItems = @("bin")
+          if ($kpStaged -gt 0) { $packItems += ".kpack" }
+          7z a -snl ..\llama-bin-win-rocm-x64.zip @packItems
           if ($LASTEXITCODE -ne 0) { Pop-Location; throw "7z failed with exit code $LASTEXITCODE" }
           Pop-Location
 
