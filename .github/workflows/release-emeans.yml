@@ -27,7 +27,8 @@ jobs:
 
       - name: Install Ninja & LLVM
         run: |
-          choco install ninja llvm --version=22.1.8 -y
+          choco install ninja -y
+          choco install llvm --version=22.1.8 -y
           echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
       - name: Build Windows x64 binaries (llama-server, llama-cli, llama-perplexity, CPU backend)

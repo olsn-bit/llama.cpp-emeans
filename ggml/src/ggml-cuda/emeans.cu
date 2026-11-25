@@ -48,6 +48,7 @@ enum EmFormat : uint32_t {
     EM_FMT_EM1D_Q4_G64   = 3,
     EM_FMT_EM1D_Q3_G64   = 4,
     EM_FMT_EM2D_K32_G128 = 5,
+    EM_FMT_EM2D_K16_G128 = 6,
 };
 
 struct EmPlane {
@@ -450,7 +451,8 @@ bool ggml_cuda_emeans_init_extra(const char * emns_path) {
 
     size_t n_added = 0;
     for (auto & kv : extra_tensors) {
-        if (kv.second.fmt != EM_FMT_EM1D_Q4_G64 && kv.second.fmt != EM_FMT_EM1D_Q3_G64 && kv.second.fmt != EM_FMT_EM2D_K32_G128) {
+        if (kv.second.fmt != EM_FMT_EM1D_Q4_G64 && kv.second.fmt != EM_FMT_EM1D_Q3_G64 &&
+            kv.second.fmt != EM_FMT_EM2D_K32_G128 && kv.second.fmt != EM_FMT_EM2D_K16_G128) {
             continue;
         }
         for (auto & pk : kv.second.planes) {
@@ -494,8 +496,9 @@ void * ggml_cuda_emeans_bind_tensor(const char * gguf_name, int64_t ne0, int64_t
     if (it == st.tensors.end()) return nullptr;
     const EmTensor & em = it->second;
 
-    // Only bind quantized formats (EM1D_Q4_G64, EM1D_Q3_G64, EM2D_K32_G128)
-    if (em.fmt != EM_FMT_EM1D_Q4_G64 && em.fmt != EM_FMT_EM1D_Q3_G64 && em.fmt != EM_FMT_EM2D_K32_G128) {
+    // Only bind quantized formats (EM1D_Q4_G64, EM1D_Q3_G64, EM2D_K32_G128, EM2D_K16_G128)
+    if (em.fmt != EM_FMT_EM1D_Q4_G64 && em.fmt != EM_FMT_EM1D_Q3_G64 &&
+        em.fmt != EM_FMT_EM2D_K32_G128 && em.fmt != EM_FMT_EM2D_K16_G128) {
         return nullptr;
     }
     // Verify shape match (GGML [K, N, E] vs EMNS [N, K] or [E, N, K])
@@ -559,7 +562,7 @@ static __device__ __forceinline__ em_gacc_t em_gacc_fdot2(uint32_t a_bits, uint3
     return __builtin_amdgcn_fdot2(ua.v, ub.v, acc, false);
 }
 static __device__ __forceinline__ float em_gacc_to_f32(em_gacc_t acc) { return acc; }
-#else
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 530
 typedef __half2 em_gacc_t;
 static __device__ __forceinline__ em_gacc_t em_gacc_zero() { return __float2half2_rn(0.0f); }
 static __device__ __forceinline__ em_gacc_t em_gacc_fdot2(uint32_t a_bits, uint32_t b_bits, em_gacc_t acc) {
@@ -572,6 +575,18 @@ static __device__ __forceinline__ float em_gacc_to_f32(em_gacc_t acc) {
     float2 f2 = __half22float2(acc);
     return f2.x + f2.y;
 }
+#else
+typedef float em_gacc_t;
+static __device__ __forceinline__ em_gacc_t em_gacc_zero() { return 0.0f; }
+static __device__ __forceinline__ em_gacc_t em_gacc_fdot2(uint32_t a_bits, uint32_t b_bits, em_gacc_t acc) {
+    __half2 ha, hb;
+    memcpy(&ha, &a_bits, sizeof(ha));
+    memcpy(&hb, &b_bits, sizeof(hb));
+    float2 fa = __half22float2(ha);
+    float2 fb = __half22float2(hb);
+    return fmaf(fa.x, fb.x, fmaf(fa.y, fb.y, acc));
+}
+static __device__ __forceinline__ float em_gacc_to_f32(em_gacc_t acc) { return acc; }
 #endif
 
 static __device__ __forceinline__ uint32_t em_pack_h16(uint32_t lo16, uint32_t hi16) {
@@ -981,6 +996,79 @@ void em_gemv_2d_k32_g128_moe_kernel(
     }
 }
 
+// --- 3b. EM2D_K16_G128 MoE GEMV (2.125 bpw, NO hi1 plane, 8 GB tier) ---
+__global__ EM_LAUNCH_BOUNDS_GEMV
+void em_gemv_2d_k16_g128_moe_kernel(
+    const uint32_t * __restrict__ lo4_all,
+    const __half   * __restrict__ scales_all,
+    const uint32_t * __restrict__ lut_h2_all,
+    const int32_t  * __restrict__ ids,
+    const uint32_t * __restrict__ x_h2_all,
+    float          * __restrict__ y_all,
+    int N, int K, int ne11, int is_w13, int64_t ids_nb1_i32, int64_t y_nb1_f32, int64_t y_nb2_f32)
+{
+    const int tid = threadIdx.x;
+    const int wave_id = tid >> 5;
+    const int lane = tid & 31;
+    const int slot = blockIdx.y;
+    const int tok  = blockIdx.z;
+    const int e    = ids[(size_t)tok * ids_nb1_i32 + slot];
+
+    const uint32_t my_lut = lut_h2_all[(size_t)e * 16 + (lane & 15)];
+
+    const int row       = blockIdx.x * 8 + wave_id;
+    const int stride_c  = K >> 5;
+    const int stride_sc = K >> 7;
+    const int n_iters   = (stride_c + 31) >> 5;
+
+    const size_t exp_c_off  = (size_t)e * N * stride_c;
+    const size_t exp_sc_off = (size_t)e * N * stride_sc;
+    const uint2  * lo4_u2  = reinterpret_cast<const uint2 *>(lo4_all) + exp_c_off;
+    const __half * sc_ptr  = scales_all + exp_sc_off;
+
+    const int x_slot = (ne11 == 1) ? 0 : slot;
+    const uint4 * x_u4 = reinterpret_cast<const uint4 *>(x_h2_all + ((size_t)tok * ne11 + x_slot) * (K >> 1));
+
+    float acc = 0.0f;
+    for (int it = 0; it < n_iters; ++it) {
+        const int c = (it << 5) + lane;
+        const bool valid = (c < stride_c);
+        const int g  = c >> 2;
+        const int xb = c << 2;
+
+        uint2 lo_row = make_uint2(0, 0);
+        float sc_row = 0.0f;
+        if (valid && row < N) {
+            const size_t idx_c = (size_t)row * stride_c + c;
+            lo_row = lo4_u2[idx_c];
+            sc_row = __half2float(sc_ptr[(size_t)row * stride_sc + g]);
+        }
+
+        em_gacc_t gacc = em_gacc_zero();
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint4 xw = valid ? x_u4[xb + w] : make_uint4(0, 0, 0, 0);
+            const uint32_t xv[4] = {xw.x, xw.y, xw.z, xw.w};
+            const int lo_shift_base = (w & 1) * 16;
+            const uint32_t lo_w = (w < 2) ? lo_row.x : lo_row.y;
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const uint32_t idx = (lo_w >> (lo_shift_base + p * 4)) & 0xFu;
+                gacc = em_gacc_fdot2(EM_SHFL(my_lut, idx, 32), xv[p], gacc);
+            }
+        }
+        acc = fmaf(em_gacc_to_f32(gacc), sc_row, acc);
+    }
+
+    if (row < N) {
+        float s = em_wave32_sum(acc);
+        if (lane == 0) {
+            const int out_row = is_w13 ? ((row & 1) ? ((N >> 1) + (row >> 1)) : (row >> 1)) : row;
+            y_all[(size_t)tok * y_nb2_f32 + (size_t)slot * y_nb1_f32 + out_row] = s;
+        }
+    }
+}
+
 // --- 4. Single-Launch Zero-Sync GPU-Grouped BT=8 MoE Prefill/Verify Kernels ---
 __global__ void em_moe_build_tiles_kernel(
     const int32_t  * __restrict__ ids,
@@ -1241,6 +1329,114 @@ void em_gemm8_2d_k32_g128_moe_kernel(
             #pragma unroll
             for (int p = 0; p < 4; ++p) {
                 const uint32_t idx = ((lo_w >> (lo_shift_base + p * 4)) & 0xFu) | (((hi_w >> (hi_shift_base + p)) & 0x1u) << 4);
+                wh2[p] = EM_SHFL(my_lut, idx, 32);
+            }
+            if (valid) {
+                for (int b = 0; b < cnt; ++b) {
+                    const uint4 xw = x_u4[s_xbase[b] + xb + w];
+                    em_gacc_t gb = gv[b];
+                    gb = em_gacc_fdot2(wh2[0], xw.x, gb);
+                    gb = em_gacc_fdot2(wh2[1], xw.y, gb);
+                    gb = em_gacc_fdot2(wh2[2], xw.z, gb);
+                    gb = em_gacc_fdot2(wh2[3], xw.w, gb);
+                    gv[b] = gb;
+                }
+            }
+        }
+        #pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            if (b < cnt) acc[b] = fmaf(em_gacc_to_f32(gv[b]), sc_row, acc[b]);
+        }
+    }
+
+    if (row < N) {
+        const int out_row = is_w13 ? ((row & 1) ? ((N >> 1) + (row >> 1)) : (row >> 1)) : row;
+        for (int b = 0; b < cnt; ++b) {
+            const float sb = em_wave32_sum(acc[b]);
+            if (lane == 0) {
+                const uint32_t pr = s_pairs[b];
+                const int tok  = (int)(pr >> 8);
+                const int slot = (int)(pr & 0xFFu);
+                y_all[(size_t)tok * y_nb2_f32 + (size_t)slot * y_nb1_f32 + out_row] = sb;
+            }
+        }
+    }
+}
+
+__global__ EM_LAUNCH_BOUNDS_GEMV
+void em_gemm8_2d_k16_g128_moe_kernel(
+    const uint32_t * __restrict__ lo4_all,
+    const __half   * __restrict__ scales_all,
+    const uint32_t * __restrict__ lut_h2_all,
+    const uint32_t * __restrict__ sorted_pairs,
+    const uint2    * __restrict__ tiles,
+    const int32_t  * __restrict__ d_num_tiles,
+    const uint32_t * __restrict__ x_h2_all,
+    float          * __restrict__ y_all,
+    int N, int K, int ne11, int is_w13, int64_t y_nb1_f32, int64_t y_nb2_f32)
+{
+    const int tile_id = blockIdx.y;
+    if (tile_id >= d_num_tiles[0]) return;
+
+    const int tid     = threadIdx.x;
+    const int wave_id = tid >> 5;
+    const int lane    = tid & 31;
+
+    const uint2 ti    = tiles[tile_id];
+    const int e       = (int)(ti.x >> 4);
+    const int cnt     = (int)(ti.x & 0xFu);
+    const int pstart  = (int)ti.y;
+
+    __shared__ uint32_t s_pairs[8];
+    __shared__ size_t   s_xbase[8];
+    if (tid < cnt) {
+        const uint32_t pr = sorted_pairs[pstart + tid];
+        s_pairs[tid] = pr;
+        const int tok  = (int)(pr >> 8);
+        const int slot = (int)(pr & 0xFFu);
+        s_xbase[tid] = ((size_t)tok * ne11 + ((ne11 == 1) ? 0 : slot)) * (size_t)(K >> 3);
+    }
+    __syncthreads();
+
+    const uint32_t my_lut = lut_h2_all[(size_t)e * 16 + (lane & 15)];
+
+    const int row       = blockIdx.x * 8 + wave_id;
+    const int stride_c  = K >> 5;
+    const int stride_sc = K >> 7;
+    const int n_iters   = (stride_c + 31) >> 5;
+
+    const size_t exp_c_off  = (size_t)e * N * stride_c;
+    const size_t exp_sc_off = (size_t)e * N * stride_sc;
+    const uint2  * lo4_u2  = reinterpret_cast<const uint2 *>(lo4_all) + exp_c_off;
+    const __half * sc_ptr  = scales_all + exp_sc_off;
+    const uint4  * x_u4    = reinterpret_cast<const uint4 *>(x_h2_all);
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int it = 0; it < n_iters; ++it) {
+        const int c = (it << 5) + lane;
+        const bool valid = (c < stride_c);
+        const int g  = c >> 2;
+        const int xb = c << 2;
+
+        uint2 lo_row = make_uint2(0, 0);
+        float sc_row = 0.0f;
+        if (valid && row < N) {
+            const size_t idx_c = (size_t)row * stride_c + c;
+            lo_row = lo4_u2[idx_c];
+            sc_row = __half2float(sc_ptr[(size_t)row * stride_sc + g]);
+        }
+
+        em_gacc_t gv[8];
+        #pragma unroll
+        for (int b = 0; b < 8; ++b) gv[b] = em_gacc_zero();
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const int lo_shift_base = (w & 1) * 16;
+            const uint32_t lo_w = (w < 2) ? lo_row.x : lo_row.y;
+            uint32_t wh2[4];
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const uint32_t idx = (lo_w >> (lo_shift_base + p * 4)) & 0xFu;
                 wh2[p] = EM_SHFL(my_lut, idx, 32);
             }
             if (valid) {
@@ -1617,6 +1813,139 @@ void em_gemm16_wmma_2d_k32_g128_moe_kernel(
     }
 #endif
 }
+
+__global__ __launch_bounds__(256, 2)
+void em_gemm16_wmma_2d_k16_g128_moe_kernel(
+    const uint32_t * __restrict__ lo4_all,
+    const __half   * __restrict__ scales_all,
+    const uint32_t * __restrict__ lut_h2_all,
+    const uint32_t * __restrict__ sorted_pairs,
+    const uint2    * __restrict__ tiles,
+    const int32_t  * __restrict__ d_num_tiles,
+    const uint32_t * __restrict__ x_h2_all,
+    float          * __restrict__ y_all,
+    int N, int K, int ne11, int is_w13, int64_t y_nb1_f32, int64_t y_nb2_f32)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    using namespace nvcuda;
+    const int tile_id = blockIdx.y;
+    if (tile_id >= d_num_tiles[0]) return;
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane    = tid & 31;
+
+    const uint2 ti    = tiles[tile_id];
+    const int e       = (int)(ti.x >> 5);
+    const int cnt     = (int)(ti.x & 0x1Fu);
+    const int pstart  = (int)ti.y;
+
+    __shared__ uint32_t s_pairs[16];
+    __shared__ size_t   s_xbase[16];
+    alignas(16) __shared__ union {
+        uint16_t w[128][40];
+        float    c[8][256];
+    } s_mem;
+    alignas(16) __shared__ uint16_t s_X[16][40];
+
+    if (tid < cnt) {
+        const uint32_t pr = sorted_pairs[pstart + tid];
+        s_pairs[tid] = pr;
+        const int tok  = (int)(pr >> 8);
+        const int slot = (int)(pr & 0xFFu);
+        s_xbase[tid] = ((size_t)tok * ne11 + ((ne11 == 1) ? 0 : slot)) * (size_t)(K >> 3);
+    }
+    __syncthreads();
+
+    const uint32_t my_lut = lut_h2_all[(size_t)e * 16 + (lane & 15)];
+
+    const int warp_row_base = blockIdx.x * 128 + warp_id * 16;
+    const int r_in_warp     = lane >> 1;
+    const int half_sel      = lane & 1;
+    const int row           = warp_row_base + r_in_warp;
+
+    const int stride_c  = K >> 5;
+    const int stride_sc = K >> 7;
+
+    const size_t exp_c_off  = (size_t)e * N * stride_c;
+    const size_t exp_sc_off = (size_t)e * N * stride_sc;
+    const uint2  * lo4_u2  = reinterpret_cast<const uint2 *>(lo4_all) + exp_c_off;
+    const __half * sc_ptr  = scales_all + exp_sc_off;
+    const uint4  * x_u4    = reinterpret_cast<const uint4 *>(x_h2_all);
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    const uint4 zero_u4 = make_uint4(0, 0, 0, 0);
+
+    for (int c = 0; c < stride_c; ++c) {
+        if (tid < 64) {
+            const int b = tid >> 2;
+            const int v = tid & 3;
+            const uint4 xw = (b < cnt) ? x_u4[s_xbase[b] + (c << 2) + v] : zero_u4;
+            *reinterpret_cast<uint4 *>(&s_X[b][v << 3]) = xw;
+        }
+
+        uint32_t lo_w = 0u;
+        __half2 sc_h2 = __float2half2_rn(0.0f);
+        if (row < N) {
+            const size_t idx_c = (size_t)row * stride_c + c;
+            const uint2 lo_row = lo4_u2[idx_c];
+            lo_w = half_sel ? lo_row.y : lo_row.x;
+            sc_h2 = __half2half2(sc_ptr[(size_t)row * stride_sc + (c >> 2)]);
+        }
+
+        __half2 * w_dst = reinterpret_cast<__half2 *>(&s_mem.w[warp_id * 16 + r_in_warp][half_sel * 16]);
+        #pragma unroll
+        for (int w = 0; w < 2; ++w) {
+            const int lo_shift_base = w * 16;
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const uint32_t idx = (lo_w >> (lo_shift_base + p * 4)) & 0xFu;
+                const uint32_t wh2_u = EM_SHFL(my_lut, idx, 32);
+                __half2 wh2;
+                memcpy(&wh2, &wh2_u, sizeof(wh2));
+                w_dst[w * 4 + p] = __hmul2(wh2, sc_h2);
+            }
+        }
+
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
+
+        const __half * w_ptr = reinterpret_cast<const __half *>(&s_mem.w[warp_id * 16][0]);
+        const __half * x_ptr = reinterpret_cast<const __half *>(&s_X[0][0]);
+
+        wmma::load_matrix_sync(a_frag, w_ptr, 40);
+        wmma::load_matrix_sync(b_frag, x_ptr, 40);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        wmma::load_matrix_sync(a_frag, w_ptr + 16, 40);
+        wmma::load_matrix_sync(b_frag, x_ptr + 16, 40);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+    }
+
+    wmma::store_matrix_sync(s_mem.c[warp_id], c_frag, 16, wmma::mem_row_major);
+    __syncwarp();
+
+    #pragma unroll
+    for (int idx = lane; idx < 256; idx += 32) {
+        const int r = idx >> 4;
+        const int b = idx & 15;
+        const int cur_row = warp_row_base + r;
+        if (b < cnt && cur_row < N) {
+            const int out_row = is_w13 ? ((cur_row & 1) ? ((N >> 1) + (cur_row >> 1)) : (cur_row >> 1)) : cur_row;
+            const uint32_t pr = s_pairs[b];
+            const int tok  = (int)(pr >> 8);
+            const int slot = (int)(pr & 0xFFu);
+            y_all[(size_t)tok * y_nb2_f32 + (size_t)slot * y_nb1_f32 + out_row] = s_mem.c[warp_id][idx];
+        }
+    }
+#endif
+}
 #endif // !GGML_USE_HIP
 
 // ============================================================================
@@ -1758,6 +2087,15 @@ bool ggml_cuda_emeans_try_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tenso
                 reinterpret_cast<const uint32_t *>(x_f16.get()),
                 (float *)dst->data,
                 N, K, ne11, em->is_w13 ? 1 : 0, ids_nb1_i32, y_nb1_f32, y_nb2_f32);
+        } else if (em->fmt == EM_FMT_EM2D_K16_G128) {
+            em_gemv_2d_k16_g128_moe_kernel<<<grid, block, 0, stream>>>(
+                em->ptr<uint32_t>("lo4"),
+                em->ptr<__half>("scales"),
+                em->ptr<uint32_t>("lut"),
+                (const int32_t *)ids->data,
+                reinterpret_cast<const uint32_t *>(x_f16.get()),
+                (float *)dst->data,
+                N, K, ne11, em->is_w13 ? 1 : 0, ids_nb1_i32, y_nb1_f32, y_nb2_f32);
         } else {
             GGML_ABORT("[emeans] unsupported MoE format %u", em->fmt);
         }
@@ -1807,6 +2145,17 @@ bool ggml_cuda_emeans_try_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tenso
                 reinterpret_cast<const uint32_t *>(x_f16.get()),
                 (float *)dst->data,
                 N, K, ne11, em->is_w13 ? 1 : 0, y_nb1_f32, y_nb2_f32);
+        } else if (em->fmt == EM_FMT_EM2D_K16_G128) {
+            em_gemm16_wmma_2d_k16_g128_moe_kernel<<<grid, block, 0, stream>>>(
+                em->ptr<uint32_t>("lo4"),
+                em->ptr<__half>("scales"),
+                em->ptr<uint32_t>("lut"),
+                d_sorted_pairs.get(),
+                d_tiles.get(),
+                d_num_tiles.get(),
+                reinterpret_cast<const uint32_t *>(x_f16.get()),
+                (float *)dst->data,
+                N, K, ne11, em->is_w13 ? 1 : 0, y_nb1_f32, y_nb2_f32);
         } else {
             GGML_ABORT("[emeans] unsupported MoE format %u", em->fmt);
         }
@@ -1847,6 +2196,17 @@ bool ggml_cuda_emeans_try_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tenso
         em_gemm8_2d_k32_g128_moe_kernel<<<grid, block, 0, stream>>>(
             em->ptr<uint32_t>("lo4"),
             em->ptr<uint16_t>("hi1"),
+            em->ptr<__half>("scales"),
+            em->ptr<uint32_t>("lut"),
+            d_sorted_pairs.get(),
+            d_tiles.get(),
+            d_num_tiles.get(),
+            reinterpret_cast<const uint32_t *>(x_f16.get()),
+            (float *)dst->data,
+            N, K, ne11, em->is_w13 ? 1 : 0, y_nb1_f32, y_nb2_f32);
+    } else if (em->fmt == EM_FMT_EM2D_K16_G128) {
+        em_gemm8_2d_k16_g128_moe_kernel<<<grid, block, 0, stream>>>(
+            em->ptr<uint32_t>("lo4"),
             em->ptr<__half>("scales"),
             em->ptr<uint32_t>("lut"),
             d_sorted_pairs.get(),
