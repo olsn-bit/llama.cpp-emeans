@@ -438,11 +438,20 @@ jobs:
             - **Linux (Ubuntu AMD ROCm / HIP):** `llama-emeans-${{ steps.tag.outputs.name }}-ubuntu-rocm-x64.tar.gz`
 
             ### Quick Start (3 Steps)
-            1. **Download & unzip** the archive for your OS/GPU, plus `Inkling-2-Mini-metadata-stub.gguf` and an `.emns` weight file (`Inkling-2-Mini-3.04bpw.emns` for 12 GB+ VRAM, or `Inkling-2-Mini-2.27bpw.emns` for 8 GB VRAM).
-            2. **Set `EMEANS_MODEL` and start `llama-server`** *(single line — paste as-is; use `.\bin\llama-server.exe` on Windows ROCm)*:
+            1. **Download & unzip** the archive for your OS/GPU, plus `Inkling-2-Mini-metadata-stub.gguf` and an `.emns` weight file from [**`olnnn/Inkling-2-Mini-EMEANS` on Hugging Face**](https://huggingface.co/olnnn/Inkling-2-Mini-EMEANS) (`Inkling-2-Mini-3.04bpw.emns` for 12 GB+ VRAM, or `Inkling-2-Mini-2.27bpw.emns` for 8 GB VRAM).
+            2. **Set `EMEANS_MODEL` and start `llama-server`:**
+
+               **Windows PowerShell** *(single-line — paste as-is; use `.\bin\llama-server.exe` on Windows ROCm)*:
                ```powershell
                $env:EMEANS_MODEL = "Inkling-2-Mini-3.04bpw.emns"
                .\llama-server.exe -m Inkling-2-Mini-metadata-stub.gguf -a Inkling-2-Mini-EMEANS -ngl 99 -np 1 -c 32768 -ub 128 -fa on -ctk q4_0 -ctv q4_0 --fit off --port 8080
                ```
+
+               **Linux (bash):**
+               ```bash
+               export EMEANS_MODEL=Inkling-2-Mini-3.04bpw.emns
+               ./llama-server -m Inkling-2-Mini-metadata-stub.gguf -a Inkling-2-Mini-EMEANS -ngl 99 -np 1 -c 32768 -ub 128 -fa on -ctk q4_0 -ctv q4_0 --fit off --port 8080
+               ```
+
                *(Start with `-c 32768` when browsers/IDEs are open to avoid VRAM spill; raise to `-c 53248` on a clean 12 GB desktop.)*
-            3. **Open `http://127.0.0.1:8080`** in your browser (or connect any OpenAI-compatible client to `http://127.0.0.1:8080/v1`).
+            3. **Open `http://127.0.0.1:8080`** in your browser, or connect any OpenAI-compatible client (Open WebUI, OpenCode, Cline, `pi`, SillyTavern, etc.) to `http://127.0.0.1:8080/v1` using model name `Inkling-2-Mini-EMEANS`.
